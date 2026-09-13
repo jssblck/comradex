@@ -96,6 +96,26 @@ impl LifecycleBuffer {
             })
     }
 
+    /// A bare quota error before any lifecycle or output is a refused create,
+    /// not accepted work. Once any other event is observed, this gate closes.
+    pub fn permits_unaccepted_quota_retry(&self, event: &Value) -> bool {
+        self.enabled
+            && self.response_id.is_none()
+            && self.events.is_empty()
+            && event.get("type").and_then(Value::as_str) == Some("error")
+            && [
+                "response",
+                "response_id",
+                "output",
+                "item",
+                "delta",
+                "usage",
+            ]
+            .iter()
+            .all(|key| event.get(key).is_none())
+            && classify_terminal_event(event).kind == FailureKind::Quota
+    }
+
     /// Release preserves the original payloads, including sequence numbers and
     /// unknown fields. Once anything is released, this attempt cannot be hidden.
     pub fn release(&mut self) -> Vec<BufferedEvent> {

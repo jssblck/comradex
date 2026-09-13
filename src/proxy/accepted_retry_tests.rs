@@ -188,7 +188,10 @@ impl Fixture {
                                 );
                                 BodyExt::boxed(http_body_util::StreamBody::new(stream))
                             } else {
-                                bytes_body(Bytes::from(json!({"error":{"code":"server_is_overloaded","message":"Capacity exhausted"}}).to_string()))
+                                let error = script.events.first().cloned().unwrap_or_else(|| {
+                                    json!({"error":{"code":"server_is_overloaded","message":"Capacity exhausted"}})
+                                });
+                                bytes_body(Bytes::from(error.to_string()))
                             };
                             Ok::<_, Infallible>(
                                 Response::builder()
@@ -372,6 +375,243 @@ async fn collect_turn(ws: &mut WebSocketStream<TcpStream>) -> Vec<Value> {
     })
     .await
     .expect("proxy did not settle the scripted turn")
+}
+
+#[tokio::test]
+async fn bridge_materialized_continuation_leaves_exhausted_owner() {
+    for failure in ["http", "sse", "already_exhausted"] {
+        let already_exhausted = failure == "already_exhausted";
+        let mut scripts = vec![success("resp_a")];
+        if !already_exhausted {
+            scripts.push(Script {
+                status: if failure == "sse" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                },
+                events: vec![json!({"type":"error","error":{"code":"usage_limit_reached"}})],
+                close: false,
+                resume_after_created: None,
+            });
+        }
+        scripts.push(success("resp_b"));
+        scripts.push(success("resp_b_next"));
+        let fixture = Fixture::start(ResponsesWebsocketMode::HttpBridge, scripts).await;
+        let mut ws = fixture.connect().await;
+        send_create(&mut ws, None).await;
+        assert_eq!(collect_turn(&mut ws).await, success("resp_a").events);
+        if already_exhausted {
+            fixture
+                .router
+                .quota_failure("a", &hyper::HeaderMap::new())
+                .await;
+        }
+        send_create(&mut ws, Some("resp_a")).await;
+        assert_eq!(collect_turn(&mut ws).await, success("resp_b").events);
+        // Continue on the same downstream socket after cutover.
+        ws.send(Message::Text(
+            json!({"type":"response.create","model":"gpt-5",
+            "previous_response_id":"resp_b","input":[{"role":"user","content":"third turn"}]})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(collect_turn(&mut ws).await, success("resp_b_next").events);
+        // Moving the new turn must not rewrite ownership of the old response.
+        for (id, owner) in [("resp_a", "a"), ("resp_b", "b")] {
+            assert_eq!(
+                fixture
+                    .router
+                    .affinity
+                    .get(
+                        &fixture
+                            .router
+                            .affinity
+                            .key(&format!("previous-response:{id}"))
+                    )
+                    .await
+                    .unwrap()
+                    .account_id,
+                owner
+            );
+        }
+        let seen = fixture.seen.lock().unwrap();
+        let continuation_index = if already_exhausted { 1 } else { 2 };
+        assert_eq!(seen.len(), continuation_index + 2);
+        assert_eq!(seen[0].authorization, "Bearer token-a");
+        assert_eq!(seen[continuation_index].authorization, "Bearer token-b");
+        assert_eq!(seen[continuation_index + 1].authorization, "Bearer token-b");
+        let body = &seen[continuation_index].body;
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(
+            body["input"],
+            json!([
+                {"role":"user","content":"hello"},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},
+                {"role":"user","content":"followup"}
+            ])
+        );
+        if !already_exhausted {
+            assert_eq!(seen[1].authorization, "Bearer token-a");
+            assert_eq!(seen[1].body, *body);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bridge_materialized_continuation_keeps_healthy_owner() {
+    let fixture = Fixture::start(
+        ResponsesWebsocketMode::HttpBridge,
+        vec![success("resp_a"), success("resp_a_next")],
+    )
+    .await;
+    let mut ws = fixture.connect().await;
+    send_create(&mut ws, None).await;
+    assert_eq!(collect_turn(&mut ws).await, success("resp_a").events);
+    fixture
+        .router
+        .set_preferred("default", Some("b".into()))
+        .await;
+    send_create(&mut ws, Some("resp_a")).await;
+    assert_eq!(collect_turn(&mut ws).await, success("resp_a_next").events);
+    let seen = fixture.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen.iter()
+            .all(|request| request.authorization == "Bearer token-a")
+    );
+}
+
+#[tokio::test]
+async fn bridge_materialized_continuation_preserves_independent_owners() {
+    for case in ["file", "turn_state", "compaction", "unmatched_tool_output"] {
+        let fixture = Fixture::start(
+            ResponsesWebsocketMode::HttpBridge,
+            vec![success("resp_a"), success("resp_unexpected")],
+        )
+        .await;
+        let mut input = json!([{"role":"user","content":"hello"}]);
+        match case {
+            "file" => {
+                fixture
+                    .file_owners
+                    .put(
+                        fixture.router.affinity.key("file:file_owned"),
+                        "a".into(),
+                        0,
+                    )
+                    .await;
+                input[0]["content"] = json!([{"type":"input_file","file_id":"file_owned"}]);
+            }
+            "turn_state" => {
+                fixture
+                    .router
+                    .bind(fixture.router.affinity.key("turn-state:owned-turn"), "a")
+                    .await;
+            }
+            "compaction" => input
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"compaction","encrypted_content":"owned"})),
+            "unmatched_tool_output" => input.as_array_mut().unwrap().push(
+                json!({"type":"function_call_output","call_id":"missing-call","output":"result"}),
+            ),
+            _ => unreachable!(),
+        }
+        let headers = if case == "turn_state" {
+            vec![("x-codex-turn-state", "owned-turn")]
+        } else {
+            vec![]
+        };
+        let mut ws = fixture.connect_with_headers(&headers).await;
+        ws.send(Message::Text(
+            json!({"type":"response.create","model":"gpt-5","input":input})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(collect_turn(&mut ws).await, success("resp_a").events);
+        fixture
+            .router
+            .quota_failure("a", &hyper::HeaderMap::new())
+            .await;
+        send_create(&mut ws, Some("resp_a")).await;
+        let result = collect_turn(&mut ws).await;
+        assert_eq!(
+            result.last().unwrap()["type"],
+            "error",
+            "{case}: {result:?}"
+        );
+        assert_eq!(fixture.seen.lock().unwrap().len(), 1, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn bridge_quota_replay_preserves_original_when_no_alternate_and_never_replays_output() {
+    let quota = json!({"type":"error","status":429,"headers":{"retry-after":"60"},"error":{"code":"usage_limit_reached"}});
+    for prelude in [
+        vec![],
+        vec![created("resp_refused")],
+        vec![
+            created("resp_refused"),
+            json!({"type":"response.output_text.delta","response_id":"resp_refused","delta":"already visible"}),
+        ],
+    ] {
+        let mut rejected = prelude.clone();
+        rejected.push(quota.clone());
+        let members = if prelude.is_empty() {
+            vec!["a"]
+        } else {
+            vec!["a", "b"]
+        };
+        let fixture = Fixture::start_with_members(
+            ResponsesWebsocketMode::HttpBridge,
+            vec![
+                success("resp_a"),
+                Script::events(rejected.clone()),
+                success("resp_unexpected"),
+            ],
+            &members,
+        )
+        .await;
+        let mut ws = fixture.connect().await;
+        send_create(&mut ws, None).await;
+        collect_turn(&mut ws).await;
+        send_create(&mut ws, Some("resp_a")).await;
+        assert_eq!(collect_turn(&mut ws).await, rejected);
+        assert_eq!(fixture.seen.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn bridge_quota_replay_refuses_response_identity_and_output_usage() {
+    for extra in [
+        json!({"response_id":"resp_accepted"}),
+        json!({"usage":{"output_tokens":1}}),
+    ] {
+        let mut error = json!({"type":"error","status":429,"headers":{},"error":{"code":"usage_limit_reached"}});
+        error
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let fixture = Fixture::start(
+            ResponsesWebsocketMode::HttpBridge,
+            vec![
+                success("resp_a"),
+                Script::events(vec![error.clone()]),
+                success("resp_unexpected"),
+            ],
+        )
+        .await;
+        let mut ws = fixture.connect().await;
+        send_create(&mut ws, None).await;
+        collect_turn(&mut ws).await;
+        send_create(&mut ws, Some("resp_a")).await;
+        assert_eq!(collect_turn(&mut ws).await, vec![error]);
+        assert_eq!(fixture.seen.lock().unwrap().len(), 2);
+    }
 }
 
 #[tokio::test]
