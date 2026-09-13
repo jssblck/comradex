@@ -132,6 +132,8 @@ fn render_plist(
     stderr: &Path,
     service_nonce: &str,
 ) -> String {
+    // Codex responsiveness depends on this relay. Background throttles CPU and
+    // I/O under load; Adaptive promotion requires XPC activity we do not use.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -147,7 +149,7 @@ fn render_plist(
   <key>WorkingDirectory</key><string>{working_directory}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
+  <key>ProcessType</key><string>Interactive</string>
   <key>SoftResourceLimits</key>
   <dict><key>NumberOfFiles</key><integer>{nofile_soft_limit}</integer></dict>
   <key>EnvironmentVariables</key>
@@ -1487,6 +1489,17 @@ mod tests {
         file.write_all(plist.as_bytes()).unwrap();
         file.as_file().sync_all().unwrap();
         validate_plist(file.path()).unwrap();
+
+        let output = Command::new("plutil")
+            .args(["-extract", "ProcessType", "raw", "--"])
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "Interactive"
+        );
 
         let output = Command::new("plutil")
             .args(["-extract", "SoftResourceLimits.NumberOfFiles", "raw", "--"])
