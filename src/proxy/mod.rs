@@ -2,6 +2,8 @@ mod accepted_retry;
 #[cfg(test)]
 mod accepted_retry_tests;
 #[cfg(test)]
+mod account_pin_tests;
+#[cfg(test)]
 mod compression_tests;
 mod context;
 mod context_codec;
@@ -1336,6 +1338,24 @@ impl App {
                 .handle_context(method, &path, &inbound_headers, listener, replay)
                 .await;
         }
+        let pool = self.pool(listener)?;
+        let inspect_model = is_native_responses(&path)
+            || inbound_headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .is_some_and(|value| {
+                    let media_type = value.trim().to_ascii_lowercase();
+                    media_type == "application/json"
+                        || (media_type.starts_with("application/") && media_type.ends_with("+json"))
+                });
+        if inspect_model && !pool.model_accounts.is_empty() && !replay.model_scan_complete() {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "model_routing_unavailable",
+                "request model could not be inspected within routing limits",
+            ));
+        }
         let context_body = if is_native_responses(&path)
             && (replay.context_session_id().is_some()
                 || replay.has_nonportable_state()
@@ -1409,7 +1429,6 @@ impl App {
                 "request contains more than 32 distinct file references",
             ));
         }
-        let pool = self.pool(listener)?;
         let mut file_ids = replay.file_ids().to_vec();
         if let Some(file_id) = finalized_file_id(&method, &path)
             && !file_ids.contains(&file_id)
@@ -1502,6 +1521,28 @@ impl App {
                 .excluded_account
                 .clone()
         });
+        let pinned_account = request_account_pin(
+            pool,
+            &method,
+            &path,
+            if inspect_model { replay.model() } else { None },
+        );
+        if let Some(account) = pinned_account {
+            if bound_account
+                .as_deref()
+                .is_some_and(|owner| owner != account)
+            {
+                return Ok(error_response(
+                    StatusCode::CONFLICT,
+                    "account_pin_conflict",
+                    "configured account pin conflicts with request continuity owner",
+                ));
+            }
+            bound_account = Some(account.to_owned());
+            // Pins remain mandatory through pre-acceptance and accepted-work retries.
+            hard_owner = true;
+            non_previous_hard_owner = true;
+        }
         if bound_account
             .as_ref()
             .is_some_and(|account| Some(account) == excluded_account.as_ref())
@@ -1514,8 +1555,12 @@ impl App {
                 None => {
                     return Ok(error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "continuity_owner_unavailable",
-                        "required continuity account is unavailable",
+                        if pinned_account.is_some() {
+                            "pinned_account_unavailable"
+                        } else {
+                            "continuity_owner_unavailable"
+                        },
+                        "required account is unavailable",
                     ));
                 }
             }
@@ -2622,6 +2667,9 @@ impl App {
             replay.prompt_cache_key(),
             replay.file_ids(),
         );
+        if !pool.model_accounts.is_empty() && !replay.model_scan_complete() {
+            anyhow::bail!("request model could not be inspected within routing limits")
+        }
         let affinity_keys: Vec<_> = affinity_values
             .iter()
             .map(|value| (value.kind, self.router.affinity.key(&value.namespaced())))
@@ -2669,6 +2717,20 @@ impl App {
         }
         if missing_hard_owner {
             anyhow::bail!("request carries hard continuity state with no known account owner")
+        }
+        if let Some(account) = replay
+            .model()
+            .and_then(|model| pool.model_accounts.get(model))
+        {
+            if hard_bound_account
+                .as_ref()
+                .is_some_and(|owner| owner != account)
+            {
+                anyhow::bail!("configured account pin conflicts with request continuity owner")
+            }
+            hard_bound_account = Some(account.clone());
+            hard_owner = true;
+            non_previous_hard_owner = true;
         }
         let selection = if let Some(account) = &hard_bound_account {
             self.router
@@ -4502,6 +4564,19 @@ fn is_native_responses(path: &str) -> bool {
         path.split('?').next().unwrap_or(path),
         "/responses" | "/responses/compact"
     )
+}
+
+fn request_account_pin<'a>(
+    pool: &'a PoolConfig,
+    method: &Method,
+    path: &str,
+    model: Option<&str>,
+) -> Option<&'a str> {
+    if matches!(*method, Method::GET | Method::HEAD) && path.split('?').next() == Some("/models") {
+        pool.models_account.as_deref()
+    } else {
+        model.and_then(|model| pool.model_accounts.get(model).map(String::as_str))
+    }
 }
 
 fn is_legacy_compact_path(path: &str) -> bool {
@@ -6695,6 +6770,7 @@ mod tests {
             members: vec!["a".into(), "b".into()],
             preferred: None,
             preserved: None,
+            ..Default::default()
         };
         let selection = router
             .select_exact(&pool, "a")
@@ -6790,6 +6866,7 @@ mod tests {
             members: vec!["a".into(), "b".into()],
             preferred: None,
             preserved: None,
+            ..Default::default()
         };
         let selection = router
             .select_exact(&pool, "a")
@@ -6898,6 +6975,7 @@ mod tests {
             members: vec!["a".into(), "b".into()],
             preferred: None,
             preserved: None,
+            ..Default::default()
         };
         let selection = router
             .select_exact(&pool, "a")
@@ -7001,6 +7079,7 @@ mod tests {
             members: vec!["a".into(), "b".into()],
             preferred: None,
             preserved: None,
+            ..Default::default()
         };
         let selection = router
             .select_exact(&pool, "a")
@@ -7178,6 +7257,7 @@ mod tests {
                         members: vec!["managed".into()],
                         preferred: None,
                         preserved: None,
+                        ..Default::default()
                     },
                 )]),
                 accounts: BTreeMap::from([(
@@ -7243,6 +7323,7 @@ mod tests {
                     members: vec!["a".into(), "b".into()],
                     preferred: None,
                     preserved: None,
+                    ..Default::default()
                 },
             )]),
             accounts: BTreeMap::from([
@@ -7289,6 +7370,7 @@ mod tests {
                     members: vec!["caller".into()],
                     preferred: None,
                     preserved: None,
+                    ..Default::default()
                 },
             )]),
             accounts: BTreeMap::from([("caller".into(), AccountConfig::Inbound)]),
@@ -8725,6 +8807,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                     members: vec!["a".into(), "b".into()],
                     preferred: None,
                     preserved: None,
+                    ..Default::default()
                 },
             )]),
             accounts: BTreeMap::from([
@@ -8897,6 +8980,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                         members: vec!["caller".into()],
                         preferred: None,
                         preserved: None,
+                        ..Default::default()
                     },
                     None,
                     None,
@@ -8994,6 +9078,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                     members: vec!["a".into(), "b".into()],
                     preferred: None,
                     preserved: None,
+                    ..Default::default()
                 },
             )]),
             accounts: BTreeMap::from([
@@ -9288,6 +9373,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                     members: vec!["caller".into()],
                     preferred: None,
                     preserved: None,
+                    ..Default::default()
                 },
             )]),
             accounts: BTreeMap::from([("caller".into(), AccountConfig::Inbound)]),
@@ -9351,6 +9437,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                     members: vec!["a".into(), "b".into()],
                     preferred: None,
                     preserved: None,
+                    ..Default::default()
                 },
             )]),
             accounts: BTreeMap::from([
@@ -9406,6 +9493,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                     members: vec!["managed".into()],
                     preferred: None,
                     preserved: None,
+                    ..Default::default()
                 },
             )]),
             accounts: BTreeMap::from([(

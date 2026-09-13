@@ -19,6 +19,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use crate::state::Stats;
 
 const REQUEST_BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_MODEL_BYTES: usize = 512;
 
 pub type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
@@ -58,6 +59,8 @@ pub struct ReplayBody {
     storage: Storage,
     len: usize,
     stats: Arc<Stats>,
+    model: Option<String>,
+    model_scan_complete: bool,
     thread_id: Option<String>,
     context_session_id: Option<String>,
     context_envelope: bool,
@@ -70,6 +73,7 @@ pub struct ReplayBody {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyKind {
+    Model,
     ClientMetadata,
     ThreadId,
     SessionId,
@@ -105,8 +109,12 @@ struct MetadataScanner {
     capture_value: Option<KeyKind>,
     token: Vec<u8>,
     token_overflow: bool,
+    model_token: Vec<u8>,
+    model_token_overflow: bool,
     key: Option<KeyKind>,
     pending_value: Option<KeyKind>,
+    model: Option<String>,
+    model_scan_incomplete: bool,
     thread_id: Option<String>,
     context_session_id: Option<String>,
     context_envelope: bool,
@@ -123,6 +131,7 @@ impl MetadataScanner {
         // An unfinished item has not established that its encrypted payload is native
         // reasoning; do not relax ownership for a truncated or malformed request.
         self.nonportable_state |= self.in_string || !self.containers.is_empty();
+        self.model_scan_incomplete |= self.in_string || !self.containers.is_empty();
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -131,6 +140,26 @@ impl MetadataScanner {
                 return;
             }
             if self.in_string {
+                // Keep a bounded JSON spelling for model names and property names,
+                // so escaped model names route exactly like their decoded spelling.
+                if ((self.string_is_key && self.containers.len() == 1)
+                    || self.capture_value == Some(KeyKind::Model))
+                    && !self.model_token_overflow
+                    && (byte != b'"' || self.escape)
+                {
+                    // Each ASCII character can occupy six bytes as a JSON escape.
+                    // Only the five-character root key `model` needs decoding.
+                    let limit = if self.string_is_key {
+                        5 * 6
+                    } else {
+                        MAX_MODEL_BYTES * 6
+                    };
+                    if self.model_token.len() < limit {
+                        self.model_token.push(byte);
+                    } else {
+                        self.model_token_overflow = true;
+                    }
+                }
                 if self.escape {
                     self.escape = false;
                     self.token_overflow = true;
@@ -165,10 +194,13 @@ impl MetadataScanner {
                     self.in_string = true;
                     self.token.clear();
                     self.token_overflow = false;
+                    self.model_token.clear();
+                    self.model_token_overflow = false;
                     self.capture_value = self.pending_value.take().filter(|kind| {
                         matches!(
                             kind,
-                            KeyKind::ThreadId
+                            KeyKind::Model
+                                | KeyKind::ThreadId
                                 | KeyKind::SessionId
                                 | KeyKind::PreviousResponseId
                                 | KeyKind::PromptCacheKey
@@ -286,6 +318,12 @@ impl MetadataScanner {
         // Also inspect an all-turns request without session metadata so it fails closed.
         self.context_envelope |= !self.string_is_key && self.token == b"all_turns";
         if let Some(kind) = self.capture_value {
+            if kind == KeyKind::Model {
+                self.model = self
+                    .decoded_model_token()
+                    .filter(|value| !value.is_empty() && value.len() <= MAX_MODEL_BYTES);
+                self.model_scan_incomplete |= self.model_token_overflow;
+            }
             if kind == KeyKind::EncryptedContent
                 && !self.token.is_empty()
                 && let Some(container) = self.containers.last_mut()
@@ -325,7 +363,8 @@ impl MetadataScanner {
                             );
                         }
                     }
-                    KeyKind::ClientMetadata
+                    KeyKind::Model
+                    | KeyKind::ClientMetadata
                     | KeyKind::Other
                     | KeyKind::Input
                     | KeyKind::EncryptedContent => {}
@@ -348,7 +387,12 @@ impl MetadataScanner {
             {
                 self.nonportable_state = true;
             }
-            self.key = if at_root && !self.token_overflow && self.token == b"client_metadata" {
+            self.key = if at_root && self.decoded_model_token().as_deref() == Some("model") {
+                // A later non-string or oversized model must not leave an earlier
+                // model active when the upstream parser uses the final property.
+                self.model = None;
+                Some(KeyKind::Model)
+            } else if at_root && !self.token_overflow && self.token == b"client_metadata" {
                 Some(KeyKind::ClientMetadata)
             } else if in_client && !self.token_overflow && self.token == b"thread_id" {
                 Some(KeyKind::ThreadId)
@@ -383,6 +427,20 @@ impl MetadataScanner {
         }
         self.capture_value = None;
         self.string_is_key = false;
+    }
+
+    fn decoded_model_token(&self) -> Option<String> {
+        if self.model_token_overflow {
+            return None;
+        }
+        if !self.model_token.contains(&b'\\') {
+            return String::from_utf8(self.model_token.clone()).ok();
+        }
+        let mut quoted = Vec::with_capacity(self.model_token.len() + 2);
+        quoted.push(b'"');
+        quoted.extend_from_slice(&self.model_token);
+        quoted.push(b'"');
+        serde_json::from_slice(&quoted).ok()
     }
 }
 
@@ -447,6 +505,8 @@ impl ReplayBody {
             len: bytes.len(),
             storage: Storage::Memory(bytes),
             stats,
+            model: metadata.model,
+            model_scan_complete: !metadata.disabled && !metadata.model_scan_incomplete,
             thread_id: metadata.thread_id,
             context_session_id: metadata.context_session_id,
             context_envelope: metadata.context_envelope,
@@ -579,6 +639,8 @@ impl ReplayBody {
             storage,
             len,
             stats,
+            model: metadata.model,
+            model_scan_complete: !metadata.disabled && !metadata.model_scan_incomplete,
             thread_id: metadata.thread_id,
             context_session_id: metadata.context_session_id,
             context_envelope: metadata.context_envelope,
@@ -588,6 +650,14 @@ impl ReplayBody {
             file_ids_overflow: metadata.file_ids_overflow,
             nonportable_state: metadata.nonportable_state,
         })
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn model_scan_complete(&self) -> bool {
+        self.model_scan_complete
     }
 
     pub fn thread_id(&self) -> Option<&str> {
@@ -719,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn zstd_metadata_and_replay_survive_chunking_and_disk_spooling() {
-        let payload = Bytes::from_static(br#"{"client_metadata":{"thread_id":"thread-1","session_id":"session-1"},"previous_response_id":"resp-1","prompt_cache_key":"cache-1","input":[{"type":"input_file","file_id":"file-1"},{"type":"compaction","encrypted_content":"owned"}]}"#);
+        let payload = Bytes::from_static(br#"{"model":"gpt-5","client_metadata":{"thread_id":"thread-1","session_id":"session-1"},"previous_response_id":"resp-1","prompt_cache_key":"cache-1","input":[{"type":"input_file","file_id":"file-1"},{"type":"compaction","encrypted_content":"owned"}]}"#);
         let wire = zstd_bytes(&payload).await;
         for memory_limit in [1, 4096] {
             let stats = Arc::new(Stats::default());
@@ -732,6 +802,8 @@ mod tests {
                 ReplayBody::read_encoded(body, true, memory_limit, 4096, 4096, stats.clone())
                     .await
                     .unwrap();
+            assert_eq!(replay.model(), Some("gpt-5"));
+            assert!(replay.model_scan_complete());
             assert_eq!(replay.thread_id(), Some("thread-1"));
             assert_eq!(replay.context_session_id(), Some("session-1"));
             assert_eq!(replay.previous_response_id(), Some("resp-1"));
@@ -819,6 +891,96 @@ mod tests {
         .unwrap();
         assert!(error.downcast_ref::<DecodeError>().is_some(), "{error:#}");
         assert_eq!(stats.active_spool_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn extracts_only_top_level_model_across_chunks() {
+        for (payload, expected) in [
+            (
+                r#"{"model":"gpt-5","input":{"model":"nested"}}"#,
+                Some("gpt-5"),
+            ),
+            (
+                r#"{"input":[{"model":"nested"}],"model":"gpt-5"}"#,
+                Some("gpt-5"),
+            ),
+            (r#"{"input":{"model":"nested"}}"#, None),
+            (r#"[{"model":"nested"}]"#, None),
+            (r#"{"model":null}"#, None),
+            (r#"{"model":""}"#, None),
+            (r#"{"model":"first","model":"last"}"#, Some("last")),
+            (r#"{"model":"first","model":null}"#, None),
+            (r#"{"model":"first","model":{"model":"nested"}}"#, None),
+            (r#"{"mo\u0064el":"gpt-\u0035"}"#, Some("gpt-5")),
+            (r#"{"model":"quoted\"model"}"#, Some("quoted\"model")),
+        ] {
+            for size in [1, 3, payload.len()] {
+                let mut scanner = MetadataScanner::default();
+                for chunk in payload.as_bytes().chunks(size) {
+                    scanner.feed(chunk);
+                }
+                scanner.finish();
+                assert_eq!(scanner.model.as_deref(), expected, "{payload}");
+            }
+        }
+
+        let mut scanner = MetadataScanner::default();
+        let oversized = format!(r#"{{"model":"first","model":"{}"}}"#, "x".repeat(3073));
+        scanner.feed(oversized.as_bytes());
+        scanner.finish();
+        assert_eq!(scanner.model, None);
+        assert!(scanner.model_scan_incomplete);
+    }
+
+    #[test]
+    fn model_scan_reports_limits_and_incomplete_requests() {
+        let nested = format!("{}null{}", "[".repeat(129), "]".repeat(129));
+        for payload in [
+            format!(r#"{{"input":{nested},"model":"gpt-5"}}"#),
+            format!(r#"{{"model":"first","input":{nested},"model":"last"}}"#),
+            format!(r#"{{"model":"{}"}}"#, "x".repeat(MAX_MODEL_BYTES * 6 + 1)),
+            r#"{"model":"unfinished"#.to_owned(),
+            r#"{"model":"gpt-5""#.to_owned(),
+        ] {
+            let replay = ReplayBody::from_bytes(
+                Bytes::from(payload),
+                10_000,
+                10_000,
+                Arc::new(Stats::default()),
+            )
+            .unwrap();
+            assert!(!replay.model_scan_complete());
+        }
+
+        // All JSON spellings of a model within the configured byte limit fit.
+        let payload = format!(r#"{{"model":"{}"}}"#, r"\u0078".repeat(MAX_MODEL_BYTES));
+        let replay = ReplayBody::from_bytes(
+            Bytes::from(payload),
+            10_000,
+            10_000,
+            Arc::new(Stats::default()),
+        )
+        .unwrap();
+        assert_eq!(replay.model(), Some("x".repeat(MAX_MODEL_BYTES).as_str()));
+        assert!(replay.model_scan_complete());
+    }
+
+    #[test]
+    fn context_routing_view_preserves_request_model() {
+        let stats = Arc::new(Stats::default());
+        let mut request = ReplayBody::from_bytes(
+            Bytes::from_static(br#"{"model":"gpt-5"}"#),
+            4096,
+            4096,
+            stats.clone(),
+        )
+        .unwrap();
+        let context =
+            ReplayBody::from_bytes(Bytes::from_static(br#"{"input":[]}"#), 4096, 4096, stats)
+                .unwrap();
+        request.use_context_routing_metadata(&context);
+        assert_eq!(request.model(), Some("gpt-5"));
+        assert!(request.model_scan_complete());
     }
 
     #[test]
