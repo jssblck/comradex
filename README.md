@@ -272,6 +272,8 @@ HTTP requests and the frame-aware WebSocket modes enforce file ownership found i
 
 Existing healthy bindings stay put even after usage crosses `switch_at`; the threshold controls only admission of new threads.
 
+The default HTTP WebSocket bridge reconstructs a continued conversation from its cached input and completed output. When that history is portable, an exhausted previous account can be replaced automatically on the same client connection, including after a pre-output HTTP quota rejection or a bare quota error before `response.created`. The previous account remains preferred while healthy. Files, turn-state ownership, configured account pins, and nonportable context still prevent cross-account replay; missing cached history requires a full resend from the client. Account switching does not resume a partially delivered answer.
+
 Capacity rejections such as `server_is_overloaded` are tracked separately from quota and
 authentication failures. Three rejections within two minutes temporarily steer new work
 toward other eligible accounts, starting at one minute and increasing to a ten-minute cap.

@@ -430,14 +430,15 @@ struct HttpBridgeCapture {
     progress_events: u64,
     delivery_failed: bool,
     lifecycle: LifecycleBuffer,
-    capacity_retry: Option<HttpBridgeCapacityRetry>,
+    retry: Option<HttpBridgeRetry>,
     lifecycle_deadline: Option<tokio::time::Instant>,
 }
 
 #[derive(Debug)]
-struct HttpBridgeCapacityRetry {
+struct HttpBridgeRetry {
     account: String,
     events: Vec<BufferedEvent>,
+    accepted_work: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1543,6 +1544,20 @@ impl App {
             hard_owner = true;
             non_previous_hard_owner = true;
         }
+        // The bridge has already replaced this response ID with its cached input
+        // and completed output. Keep the previous account while it is healthy,
+        // but do not make that now-redundant anchor block a portable continuation.
+        // Raw HTTP anchors and independent owners still require their account.
+        let materialized_previous_owner = routing_previous_response_id.is_some()
+            && !non_previous_hard_owner
+            && file_ids.is_empty()
+            && !replay.has_nonportable_state()
+            && bridge_dispatch.as_ref().is_some_and(|dispatch| {
+                dispatch.lock().expect("bridge dispatch").cross_account_safe
+            });
+        if materialized_previous_owner {
+            hard_owner = false;
+        }
         if bound_account
             .as_ref()
             .is_some_and(|account| Some(account) == excluded_account.as_ref())
@@ -1550,7 +1565,14 @@ impl App {
             anyhow::bail!("accepted retry cannot leave its continuity owner")
         }
         let first = if let Some(account) = &bound_account {
-            match self.router.select_exact(pool, account).await {
+            let mut selection = self.router.select_exact(pool, account).await;
+            if selection.is_none() && materialized_previous_owner {
+                selection = self
+                    .router
+                    .select(&listener.pool, pool, None, Some(account))
+                    .await;
+            }
+            match selection {
                 Some(selection) => selection,
                 None => {
                     return Ok(error_response(
@@ -1615,7 +1637,7 @@ impl App {
             {
                 let wired = self.router.wired_account(&listener.pool).await;
                 log_stale_selection("http", &selected, reason, resolve_elapsed, wired.as_deref());
-                if hard_owner || selected.bound {
+                if hard_owner || (selected.bound && !materialized_previous_owner) {
                     // Hard continuity stays fail-closed: never replay bound threads/files/
                     // previous_response across accounts.
                     return Ok(error_response(
@@ -1831,7 +1853,10 @@ impl App {
                     }
                     if status.is_success() {
                         for (kind, key) in &affinity_keys {
-                            if *kind != metadata::AffinityKind::File {
+                            if *kind != metadata::AffinityKind::File
+                                && !(materialized_previous_owner
+                                    && *kind == metadata::AffinityKind::PreviousResponse)
+                            {
                                 if defer_affinity {
                                     deferred_affinity.push(key.clone());
                                 } else {
@@ -2500,8 +2525,9 @@ impl App {
             cross_account_safe: bridge_replayable,
             ..BridgeDispatchState::default()
         }));
-        let mut fallback: Option<HttpBridgeCapacityRetry> = None;
-        let mut accepted_retry = false;
+        let mut fallback: Option<HttpBridgeRetry> = None;
+        let mut retry_used = false;
+        let mut accepted_work = false;
         loop {
             let replay = match ReplayBody::from_bytes(
                 body.clone(),
@@ -2512,7 +2538,7 @@ impl App {
                 Ok(replay) => replay,
                 Err(error) => {
                     if let Some(fallback) = fallback {
-                        send_bridge_capacity_fallback(outbound, fallback).await;
+                        send_bridge_retry_fallback(outbound, fallback).await;
                     } else {
                         send_ws_error(outbound, "invalid_request_error", &error.to_string()).await;
                     }
@@ -2539,7 +2565,7 @@ impl App {
                 Ok(Ok(response)) => response,
                 failure => {
                     if let Some(fallback) = fallback {
-                        send_bridge_capacity_fallback(outbound, fallback).await;
+                        send_bridge_retry_fallback(outbound, fallback).await;
                     } else if let Ok(Err(error)) = failure {
                         send_ws_error(outbound, "proxy_error", &error.to_string()).await;
                     } else {
@@ -2560,8 +2586,8 @@ impl App {
                         .is_none_or(|selected| selected.account == original.account))
             {
                 // No replacement stream was established. Preserve the original
-                // accepted rejection, including its original ID and sequence.
-                send_bridge_capacity_fallback(outbound, original).await;
+                // rejection, including its original ID and sequence when present.
+                send_bridge_retry_fallback(outbound, original).await;
                 return;
             }
             let close_for_inbound_auth = response.status() == StatusCode::UNAUTHORIZED
@@ -2577,10 +2603,8 @@ impl App {
             let retry_policy = {
                 let dispatch = dispatch.lock().expect("bridge dispatch");
                 HttpBridgeRetryPolicy {
-                    allowed: !accepted_retry
-                        && dispatch.attempts < 2
-                        && dispatch.cross_account_safe,
-                    accepted_work: accepted_retry,
+                    allowed: !retry_used && dispatch.attempts < 2 && dispatch.cross_account_safe,
+                    accepted_work,
                 }
             };
             let pump_result = pump_http_response_to_websocket(
@@ -2609,8 +2633,9 @@ impl App {
                 Ok(Some(retry)) => {
                     dispatch.lock().expect("bridge dispatch").excluded_account =
                         Some(retry.account.clone());
+                    accepted_work |= retry.accepted_work;
                     fallback = Some(retry);
-                    accepted_retry = true;
+                    retry_used = true;
                     // The bridge already materialized this response anchor, and
                     // the gate proved that no independent hard owner remains.
                     routing_previous_response_id = None;
@@ -5493,7 +5518,7 @@ async fn send_ws_error(outbound: &BridgeSender, kind: &str, message: &str) {
     let _ = outbound.send(Message::Text(payload.into())).await;
 }
 
-async fn send_bridge_capacity_fallback(outbound: &BridgeSender, fallback: HttpBridgeCapacityRetry) {
+async fn send_bridge_retry_fallback(outbound: &BridgeSender, fallback: HttpBridgeRetry) {
     for event in fallback.events {
         if !outbound.send(Message::Text(event.payload.into())).await {
             return;
@@ -5731,7 +5756,7 @@ async fn pump_http_response_to_websocket(
     response_created_deadline: tokio::time::Instant,
     upstream_idle_timeout: Duration,
     retry_policy: HttpBridgeRetryPolicy,
-) -> std::result::Result<Option<HttpBridgeCapacityRetry>, HttpBridgePumpFailure> {
+) -> std::result::Result<Option<HttpBridgeRetry>, HttpBridgePumpFailure> {
     let mut capture = HttpBridgeCapture {
         quota_owner: response
             .extensions()
@@ -5751,7 +5776,7 @@ async fn pump_http_response_to_websocket(
         progress_events: 0,
         delivery_failed: false,
         lifecycle: LifecycleBuffer::new(retry_policy.allowed),
-        capacity_retry: None,
+        retry: None,
         lifecycle_deadline: None,
     };
     let mut liveness = None;
@@ -6011,7 +6036,7 @@ async fn pump_http_response_to_websocket(
         }
     }
     result
-        .map(|()| capture.capacity_retry.take())
+        .map(|()| capture.retry.take())
         .map_err(|error| HttpBridgePumpFailure {
             error,
             delivered_event: capture.delivered_event,
@@ -6048,16 +6073,24 @@ async fn send_protocol_events(
                 }
             }
             if let Some(account) = account
-                && capture.lifecycle.permits_capacity_retry(&event.value)
+                && (capture.lifecycle.permits_capacity_retry(&event.value)
+                    || capture
+                        .lifecycle
+                        .permits_unaccepted_quota_retry(&event.value))
             {
                 let mut events = capture.lifecycle.release();
                 events.push(BufferedEvent {
-                    payload: event.payload,
+                    payload: if is_quota {
+                        enrich_bridge_quota_payload(&event.payload, &event.value, response_headers)
+                    } else {
+                        event.payload
+                    },
                     value: event.value,
                 });
-                capture.capacity_retry = Some(HttpBridgeCapacityRetry {
+                capture.retry = Some(HttpBridgeRetry {
                     account: account.to_owned(),
                     events,
+                    accepted_work: capture.response_created,
                 });
                 return Ok(true);
             }
