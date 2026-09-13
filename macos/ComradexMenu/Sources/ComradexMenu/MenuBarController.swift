@@ -306,7 +306,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if let error = store.errorMessage, store.snapshot == nil {
             return error.contains("unknown variant") ? "Update required" : "Unavailable"
         }
-        if store.errorMessage != nil { return "Reconnecting · showing last update" }
+        if store.errorMessage != nil { return "Reconnecting" }
         if store.snapshot?.daemonRunning == true { return "Running" }
         return store.isRefreshing ? "Connecting" : "Unavailable"
     }

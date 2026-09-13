@@ -377,6 +377,9 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertEqual(store.snapshot, cached)
         controller.rebuildMenu()
         XCTAssertTrue(controller.renderedMenu.items.first?.toolTip?.contains("unavailable") == true)
+        if #available(macOS 14.4, *) {
+            XCTAssertEqual(controller.renderedMenu.items.first?.subtitle, "Reconnecting")
+        }
         XCTAssertFalse(controller.renderedMenu.items.contains { $0.title == "Status may be out of date" })
 
         controller.startPolling(intervalNanoseconds: 10_000_000)
