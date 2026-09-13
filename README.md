@@ -112,6 +112,19 @@ comradex account remove personal_2
 
 `account preserve <name>` reserves that account for last use in the pool. New, unbound work uses other eligible accounts first, even when their usage is above the rotation threshold. The preserved account remains available when all others are unavailable or excluded from a retry. Existing conversations keep their account bindings. Use `--pool <name>` to select a pool or `--clear` to remove preservation. Changes apply live without restarting the daemon and persist as `preserved` in the pool's configuration. A pool can prefer one account and preserve another; it cannot prefer and preserve the same account.
 
+To pin a model or the model listing API to an account, edit the pool in `comradex.toml` and restart the daemon:
+
+```toml
+[pools.default]
+members = ["personal", "work"]
+models_account = "work"
+model_accounts = { "gpt-5.5" = "personal", "gpt-5.6-sol" = "work" }
+```
+
+`model_accounts` matches the exact requested model ID. `models_account` selects the account for `GET /models` and `HEAD /models`, including query parameters, independently of model-specific pins. Both settings are optional; pinned accounts must exist and belong to the pool. These are strict assignments: an unavailable pinned account returns an error instead of falling back to another account. A conflicting account-owned continuation or file also returns an error. Unpinned requests keep the normal routing behavior. Removing an account clears its pins.
+
+Model-specific pins require the default `responses_websocket_mode = "http_bridge"` or `"direct"`. Configuration with model-specific pins and `"raw"` mode is rejected because raw WebSocket traffic cannot be inspected for model IDs. A model listing pin alone is compatible with every WebSocket mode.
+
 The equivalent manual configuration is:
 
 ```toml

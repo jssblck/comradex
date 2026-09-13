@@ -135,7 +135,7 @@ pub struct ListenerConfig {
     pub pool: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PoolConfig {
     pub members: Vec<String>,
     /// Account preferred for fresh, unbound work. Sticky conversations and hard ownership
@@ -145,6 +145,12 @@ pub struct PoolConfig {
     /// Account used last for fresh work; existing bindings keep their owner.
     #[serde(default)]
     pub preserved: Option<String>,
+    /// Exact model IDs that must use a particular account, without cross-account fallback.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_accounts: BTreeMap<String, String>,
+    /// Account that must serve the model listing API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +309,41 @@ impl Config {
             bail!("at least one listener is required")
         }
         for (pool_name, pool) in &self.pools {
+            if !pool.model_accounts.is_empty()
+                && self.proxy.responses_websocket_mode == ResponsesWebsocketMode::Raw
+            {
+                bail!(
+                    "pool {pool_name} model_accounts requires responses_websocket_mode = http_bridge or direct; raw WebSockets cannot inspect model IDs"
+                )
+            }
+            for (model, account) in &pool.model_accounts {
+                if model.trim().is_empty() {
+                    bail!("pool {pool_name} has an empty model ID in model_accounts")
+                }
+                if model.len() > 512 {
+                    bail!("pool {pool_name} model ID exceeds the 512-byte limit")
+                }
+                if !self.accounts.contains_key(account) {
+                    bail!("pool {pool_name} pins model {model} to missing account {account}")
+                }
+                if !pool.members.contains(account) {
+                    bail!(
+                        "pool {pool_name} pins model {model} to account {account}, which is not one of its members"
+                    )
+                }
+            }
+            if let Some(account) = &pool.models_account {
+                if !self.accounts.contains_key(account) {
+                    bail!(
+                        "pool {pool_name} pins the model listing API to missing account {account}"
+                    )
+                }
+                if !pool.members.contains(account) {
+                    bail!(
+                        "pool {pool_name} pins the model listing API to account {account}, which is not one of its members"
+                    )
+                }
+            }
             if let Some(preserved) = &pool.preserved {
                 if !pool.members.contains(preserved) {
                     bail!(
@@ -477,6 +518,116 @@ kind = "inbound"
         fs::write(&path, text).unwrap();
         let error = Config::load(&path).unwrap_err();
         assert!(error.to_string().contains("not one of its members"));
+    }
+
+    #[test]
+    fn account_pins_default_to_unset_and_round_trip() {
+        let mut config: Config = toml::from_str(&config_text(None)).unwrap();
+        let pool = config.pools.get_mut("default").unwrap();
+        assert!(pool.model_accounts.is_empty());
+        assert!(pool.models_account.is_none());
+        let serialized = toml::to_string(pool).unwrap();
+        assert!(!serialized.contains("model_accounts"));
+        assert!(!serialized.contains("models_account"));
+
+        pool.model_accounts
+            .insert("gpt-example".into(), "caller".into());
+        pool.models_account = Some("caller".into());
+        config.validate().unwrap();
+        let decoded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            decoded.pools["default"].model_accounts["gpt-example"],
+            "caller"
+        );
+        assert_eq!(
+            decoded.pools["default"].models_account.as_deref(),
+            Some("caller")
+        );
+    }
+
+    #[test]
+    fn account_pins_require_existing_pool_members_and_nonempty_models() {
+        for listing in [false, true] {
+            for configured in [false, true] {
+                let mut config: Config = toml::from_str(&config_text(None)).unwrap();
+                if configured {
+                    config
+                        .accounts
+                        .insert("outside".into(), AccountConfig::Inbound);
+                }
+                let pool = config.pools.get_mut("default").unwrap();
+                if listing {
+                    pool.models_account = Some("outside".into());
+                } else {
+                    pool.model_accounts
+                        .insert("gpt-example".into(), "outside".into());
+                }
+                let error = config.validate().unwrap_err().to_string();
+                assert!(error.contains(if configured {
+                    "not one of its members"
+                } else {
+                    "missing account"
+                }));
+            }
+        }
+        for model in ["", " \t"] {
+            let mut config: Config = toml::from_str(&config_text(None)).unwrap();
+            config
+                .pools
+                .get_mut("default")
+                .unwrap()
+                .model_accounts
+                .insert(model.into(), "caller".into());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("empty model ID")
+            );
+        }
+        let mut config: Config = toml::from_str(&config_text(None)).unwrap();
+        config
+            .pools
+            .get_mut("default")
+            .unwrap()
+            .model_accounts
+            .insert("x".repeat(513), "caller".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("512-byte limit")
+        );
+    }
+
+    #[test]
+    fn model_pins_require_a_model_aware_websocket_mode() {
+        let mut config: Config = toml::from_str(&config_text(None)).unwrap();
+        config.proxy.responses_websocket_mode = ResponsesWebsocketMode::Raw;
+        config.pools.get_mut("default").unwrap().models_account = Some("caller".into());
+        config.validate().unwrap();
+        config
+            .pools
+            .get_mut("default")
+            .unwrap()
+            .model_accounts
+            .insert("gpt-example".into(), "caller".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("http_bridge or direct")
+        );
+        for mode in [
+            ResponsesWebsocketMode::HttpBridge,
+            ResponsesWebsocketMode::Direct,
+        ] {
+            config.proxy.responses_websocket_mode = mode;
+            config.validate().unwrap();
+        }
     }
 
     #[test]

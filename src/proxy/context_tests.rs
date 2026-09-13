@@ -187,6 +187,7 @@ fn context_test_app_with_preference(
                 members: vec!["a".into(), "b".into()],
                 preferred: preferred.map(str::to_owned),
                 preserved: None,
+                ..Default::default()
             },
         )]),
         accounts: BTreeMap::from([

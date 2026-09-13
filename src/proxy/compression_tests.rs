@@ -105,6 +105,7 @@ async fn fixture_with_spool_limit(
                 members: vec!["caller".into()],
                 preferred: None,
                 preserved: None,
+                ..Default::default()
             },
         )]),
         accounts: BTreeMap::from([("caller".into(), AccountConfig::Inbound)]),

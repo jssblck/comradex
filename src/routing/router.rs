@@ -1435,6 +1435,7 @@ mod tests {
                     members: vec!["a".into(), "b".into()],
                     preferred: None,
                     preserved: None,
+                    ..Default::default()
                 },
             )]),
             accounts: BTreeMap::from([

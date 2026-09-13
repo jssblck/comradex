@@ -311,6 +311,7 @@ async fn start_context_proxy(
                 members: vec!["a".into(), "b".into()],
                 preferred: None,
                 preserved: None,
+                ..Default::default()
             },
         )]),
         accounts: BTreeMap::from([

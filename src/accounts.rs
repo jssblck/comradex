@@ -158,11 +158,24 @@ pub fn remove_account(text: &str, name: &str) -> Result<(String, Option<String>)
                 members.retain(|member| member.as_str() != Some(name));
                 members.fmt();
             }
-            for field in ["preferred", "preserved"] {
+            for field in ["preferred", "preserved", "models_account"] {
                 if pool.get(field).and_then(Item::as_str) == Some(name) {
                     pool.as_table_like_mut()
                         .expect("pool was already accessed as a table")
                         .remove(field);
+                }
+            }
+            if let Some(pins) = pool
+                .get_mut("model_accounts")
+                .and_then(Item::as_table_like_mut)
+            {
+                let removed_models: Vec<String> = pins
+                    .iter()
+                    .filter(|(_, account)| account.as_str() == Some(name))
+                    .map(|(model, _)| model.to_owned())
+                    .collect();
+                for model in removed_models {
+                    pins.remove(&model);
                 }
             }
         }
@@ -413,6 +426,46 @@ kind = "inbound"
 
         let (removed, _) = remove_account(&preferred, "work2").unwrap();
         assert!(!removed.contains("preferred"));
+    }
+
+    #[test]
+    fn removing_account_clears_its_pins_in_table_and_inline_forms() {
+        for pins in [
+            "model_accounts = { remove = \"work2\", keep = \"caller\" }",
+            "[pools.default.model_accounts]\nremove = \"work2\"\nkeep = \"caller\" # keep this pin",
+        ] {
+            let added = add_account(TEMPLATE, "work2", "default").unwrap();
+            let pinned = added.replace(
+                "members = [\"caller\", \"work2\"]",
+                &format!("members = [\"caller\", \"work2\"]\nmodels_account = \"work2\"\n{pins}"),
+            );
+            let (removed, _) = remove_account(&pinned, "work2").unwrap();
+            let config: crate::config::Config = toml::from_str(&removed).unwrap();
+            config.validate().unwrap();
+            let pool = &config.pools["default"];
+            assert!(pool.models_account.is_none());
+            assert_eq!(pool.model_accounts.len(), 1);
+            assert_eq!(pool.model_accounts["keep"], "caller");
+            assert!(removed.contains("# my listener"));
+            if pins.contains("# keep this pin") {
+                assert!(removed.contains("# keep this pin"));
+            }
+        }
+    }
+
+    #[test]
+    fn removing_other_account_preserves_model_listing_pin() {
+        let added = add_account(TEMPLATE, "work2", "default").unwrap();
+        let pinned = added.replace(
+            "members = [\"caller\", \"work2\"]",
+            "members = [\"caller\", \"work2\"]\nmodels_account = \"caller\"",
+        );
+        let (removed, _) = remove_account(&pinned, "work2").unwrap();
+        let config: crate::config::Config = toml::from_str(&removed).unwrap();
+        assert_eq!(
+            config.pools["default"].models_account.as_deref(),
+            Some("caller")
+        );
     }
 
     #[test]
