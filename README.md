@@ -336,6 +336,26 @@ data, 128 responses, 90-second confirmation deadlines, and a 30-minute lifetime.
 expired confirmation fails closed because delivery may be unknown. The HTTP bridge rejects these
 native controls with guidance to use direct or raw mode; raw mode remains an uninspected relay.
 
+### Optional Desktop backend compatibility
+
+Native Desktop backend compatibility is disabled unless `[proxy.desktop]` specifies a loopback
+`address` and an existing `pool`. `comradex install --desktop` sets the macOS launch environment's
+`CODEX_API_BASE_URL` to the authenticated listener path. Fully quit and reopen Desktop to apply it.
+`comradex uninstall` restores the exact prior value, including unset or empty values; it refuses to
+overwrite a later foreign change and retains its recovery record on failure.
+
+The listener forwards `/backend-api/codex/*` through normal pool routing. Other backend HTTP and
+WebSocket requests retain Desktop's own authorization and go only to `https://chatgpt.com`.
+Successful WHAM usage responses project pool availability into the general rate-limit fields while
+preserving credits, plan identity, reset information, and model-specific limits. This is an
+availability view, not summed quota. Unrecognized or encoded usage responses pass through unchanged.
+
+The reported Desktop seam currently trusts `localhost:8000`; configure `127.0.0.1:8000` only if
+using that integration and the port is available. The authenticated URL path and behavior of an
+installed Desktop build still require live qualification. Automated tests cover the local listener,
+passthrough, pool routing, usage projection, readiness, and environment restoration; they do not
+establish compatibility with every Desktop version.
+
 Both Responses WebSocket modes can use their one unused replay allowance after an explicit capacity rejection when the upstream emitted only empty `response.created`/`response.in_progress` metadata and the terminal proves zero output tokens. Missing usage, output items or deltas (including reasoning and tools), quota failures, and interrupted streams do not qualify. Eligible metadata is buffered for at most one second, 16 frames, or 64 KiB; any other event releases it immediately. A successful alternate therefore exposes one lifecycle with its original response ID and sequence numbers. When no alternate can be dispatched, the original lifecycle and rejection are preserved. File, turn-state, and nonportable context ownership restrictions still apply. Raw HTTP streaming does not use this accepted-work retry.
 
 HTTP bridge sessions have their own `proxy.max_bridge_sessions` limit (256 by default), separate from `proxy.max_upgrades`, which continues to bound raw/direct upstream upgrades and Live Voice. At bridge capacity, Comradex closes the least-recently-used idle session before admitting a replacement. Sessions with active turns are never evicted. Idle bridge sessions close after `proxy.bridge_idle_seconds` (900 by default), and admission waits up to `proxy.bridge_admission_timeout_millis` (2000 by default) for a closing session before returning a retryable `503 at_capacity` response with `Retry-After: 1`.

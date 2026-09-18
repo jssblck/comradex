@@ -12,6 +12,9 @@ mod context_store;
 mod context_tests;
 #[cfg(test)]
 mod context_ws_tests;
+mod desktop;
+#[cfg(test)]
+mod desktop_tests;
 mod headers;
 #[cfg(test)]
 mod http_continuity_tests;

@@ -49,6 +49,10 @@ enum CommandName {
         /// openai_base_url (active turns may be interrupted)
         #[arg(long)]
         restart_codex: bool,
+        /// Also wire native Desktop backend calls through configured proxy.desktop (macOS).
+        /// Fully quit and reopen Desktop afterwards to pick up its launch environment.
+        #[arg(long)]
+        desktop: bool,
     },
     Uninstall {
         /// SIGTERM running Codex app-server processes so they pick up the
@@ -182,7 +186,24 @@ async fn main() -> Result<()> {
             codex_config,
             listener,
             restart_codex,
+            desktop,
         } => {
+            let desktop_install = if desktop {
+                let config = load_config(&config_path)?;
+                let listener = config.proxy.desktop.as_ref().context(
+                    "configure [proxy.desktop] address = '127.0.0.1:8000' and pool before install --desktop",
+                )?;
+                Some((
+                    state_dir(&config).join("desktop-install.json"),
+                    format!(
+                        "http://localhost:{}/{}/backend-api",
+                        listener.address.port(),
+                        config.proxy.installation_secret
+                    ),
+                ))
+            } else {
+                None
+            };
             let codex_config = match codex_config {
                 Some(path) => path,
                 None => default_codex_config_path(
@@ -190,11 +211,26 @@ async fn main() -> Result<()> {
                     std::env::var_os("HOME"),
                 )?,
             };
+            if let Some((record, url)) = &desktop_install {
+                install::check_desktop_install(record, url)?;
+            }
             install_config(&config_path, &codex_config, &listener)?;
+            if let Some((record, url)) = desktop_install {
+                install::install_desktop(&record, &url)?;
+                println!(
+                    "installed Desktop backend URL; fully quit and reopen Desktop to apply it"
+                );
+            }
             handle_running_codex(restart_codex)
         }
         CommandName::Uninstall { restart_codex } => {
             let config = load_config(&config_path)?;
+            let desktop_record = state_dir(&config).join("desktop-install.json");
+            let desktop_installed = desktop_record.exists();
+            install::uninstall_desktop(&desktop_record)?;
+            if desktop_installed {
+                println!("restored Desktop backend URL; fully quit and reopen Desktop to apply it");
+            }
             install::uninstall(&state_dir(&config).join("install.json"))?;
             handle_running_codex(restart_codex)
         }
@@ -357,6 +393,9 @@ async fn serve_once(path: &Path) -> Result<bool> {
     let mut tasks = tokio::task::JoinSet::new();
     for (name, listener) in config.listeners.clone() {
         tasks.spawn(app.clone().run_listener(name, listener));
+    }
+    if let Some(listener) = config.proxy.desktop.clone() {
+        tasks.spawn(app.clone().run_desktop_listener(listener));
     }
     let background_config = config.clone();
     let background_router = router.clone();

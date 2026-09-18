@@ -68,6 +68,9 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
+    /// Optional native Desktop backend listener. Omitted by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<ListenerConfig>,
     #[serde(default = "default_upstream")]
     pub upstream: String,
     #[serde(default = "default_switch")]
@@ -108,6 +111,7 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
+            desktop: None,
             upstream: default_upstream(),
             switch_at: default_switch(),
             max_inflight: default_inflight(),
@@ -308,6 +312,31 @@ impl Config {
         if self.listeners.is_empty() {
             bail!("at least one listener is required")
         }
+        if let Some(desktop) = &self.proxy.desktop {
+            if desktop.address.ip() != std::net::Ipv4Addr::LOCALHOST || desktop.address.port() == 0
+            {
+                bail!("proxy.desktop.address must use 127.0.0.1 and a nonzero port")
+            }
+            if self
+                .listeners
+                .values()
+                .any(|listener| listener.address == desktop.address)
+            {
+                bail!("proxy.desktop.address conflicts with a normal listener")
+            }
+            let pool = self
+                .pools
+                .get(&desktop.pool)
+                .context("proxy.desktop references a missing pool")?;
+            if pool.members.is_empty()
+                || pool
+                    .members
+                    .iter()
+                    .any(|member| !self.accounts.contains_key(member))
+            {
+                bail!("proxy.desktop pool must contain configured accounts")
+            }
+        }
         for (pool_name, pool) in &self.pools {
             if !pool.model_accounts.is_empty()
                 && self.proxy.responses_websocket_mode == ResponsesWebsocketMode::Raw
@@ -426,6 +455,25 @@ members = ["caller"]
 kind = "inbound"
 "#
         )
+    }
+
+    #[test]
+    fn desktop_listener_is_opt_in_and_loopback_only() {
+        let mut config: Config = toml::from_str(&config_text(None)).unwrap();
+        assert!(config.proxy.desktop.is_none());
+        for (address, valid) in [
+            ("127.0.0.1:8000", true),
+            ("127.0.0.1:4511", true),
+            ("0.0.0.0:8000", false),
+            ("127.0.0.1:0", false),
+            ("127.0.0.1:10100", false),
+        ] {
+            config.proxy.desktop = Some(ListenerConfig {
+                address: address.parse().unwrap(),
+                pool: "default".into(),
+            });
+            assert_eq!(config.validate().is_ok(), valid, "{address}");
+        }
     }
 
     #[test]
