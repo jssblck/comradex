@@ -630,7 +630,7 @@ async fn signed_context_wrapper_can_rotate_inference_without_moving_notes_owner(
 }
 
 #[tokio::test]
-async fn native_reasoning_and_signed_context_replay_together_unchanged() {
+async fn signed_context_does_not_make_unrelated_native_reasoning_portable() {
     let upstream = start_upstream(Arc::new(|request| {
         if request.path.contains("/alpha/notes/") {
             return (
@@ -661,7 +661,7 @@ async fn native_reasoning_and_signed_context_replay_together_unchanged() {
         response_with_context_wrapper(&wrapper, true),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 
     let seen = upstream.seen.lock().unwrap();
     let attempted: Vec<_> = seen
@@ -674,9 +674,8 @@ async fn native_reasoning_and_signed_context_replay_together_unchanged() {
                     .any(|window| window == b"call_context")
         })
         .collect();
-    assert_eq!(attempted.len(), 2);
+    assert_eq!(attempted.len(), 1);
     assert_eq!(attempted[0].account_id, "workspace-a");
-    assert_eq!(attempted[1].account_id, "workspace-b");
     for attempt in attempted {
         assert!(
             attempt
@@ -1070,4 +1069,61 @@ async fn context_401_retries_refreshed_credentials_on_the_same_physical_owner() 
     );
     assert_eq!(seen[1].authorization, format!("Bearer {newer_token}"));
     assert_eq!(seen[0].body, seen[1].body);
+}
+
+#[tokio::test]
+async fn native_reasoning_auth_refresh_preserves_request_bytes_and_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("a");
+    let refreshed = test_token("workspace-a", "user-a").replacen("e30.", "e31.", 1);
+    let next_token = refreshed.clone();
+    let requests = std::sync::atomic::AtomicUsize::new(0);
+    let upstream = start_upstream(Arc::new(move |_| {
+        if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Simulate the normal concurrent-refresh path without OAuth I/O.
+            fs::write(
+                home.join("auth.json"),
+                serde_json::to_vec(&json!({
+                    "tokens":{"access_token":next_token,"account_id":"workspace-a"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error":{"code":"token_expired"}}),
+            )
+        } else {
+            (
+                StatusCode::OK,
+                json!({"id":"resp_next","status":"completed","output":[]}),
+            )
+        }
+    }))
+    .await;
+    let test = context_test_app(dir.path(), upstream.address);
+    test.app
+        .router
+        .bind(
+            test.app.router.affinity.key("previous-response:resp_owner"),
+            "a",
+        )
+        .await;
+    let body = Bytes::from_static(br#"{ "previous_response_id": "resp_owner", "input": [{"type":"reasoning","id":"rs_owner","encrypted_content":"owned"},{"type":"message","id":"msg_owner","role":"assistant","content":[]}] }"#);
+    let (status, _) = post(
+        &test.app,
+        &test.listener,
+        "/responses",
+        hyper::HeaderMap::new(),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen.iter()
+            .all(|request| request.account_id == "workspace-a" && request.body == body)
+    );
+    assert_eq!(seen[1].authorization, format!("Bearer {refreshed}"));
 }

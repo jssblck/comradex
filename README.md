@@ -246,9 +246,9 @@ does not change inference quota state or globally stop inference.
 
 The relay preserves native encrypted arguments and protocol headers. It authenticates and encrypts
 the combined tool result, then restores the native results before the next inference request. Only
-verified context outputs receive portable routing treatment on this path. Native reasoning items
-with nonempty encrypted content directly in Responses input are also portable, with their full item
-shape preserved. Other account-owned state retains its continuity restrictions. HTTP, the HTTP WebSocket
+verified context outputs receive portable routing treatment on this path. Native reasoning, encrypted
+content, and source-owned Responses input item IDs prevent cross-account replay. Tool `call_id`
+values and IDs nested in application data are not Responses item ownership. HTTP, the HTTP WebSocket
 bridge, and direct Responses WebSockets support this path. Backend-alias Responses WebSockets use
 frame inspection even when the legacy `/v1` transport is configured as raw.
 
@@ -264,13 +264,21 @@ Each listener maps to an account pool. Comradex uses Codex's continuity signals 
 
 Routing recognizes client turn state, accepted Codex session/conversation headers, parent-thread and turn-metadata IDs, request `client_metadata.thread_id`, `previous_response_id`, and `prompt_cache_key`. Values are persisted only as keyed BLAKE3 hashes. Conflicting hard owners and unknown previous-response or turn-state anchors fail closed instead of crossing accounts. Returned HTTP turn-state owners are persisted before their headers reach the client, so ending a stream before HTTP EOF cannot strand its next continuation; soft success affinity remains gated on a non-quota terminal.
 
+Soft placement prefers a known prompt-cache cohort, then a session, then thread identity, then a
+parent-thread hint. Parent hints are lookup-only: a child cannot rewrite its parent's placement.
+A hard owner takes precedence while preserving an existing shared cache/session cohort binding.
+
+Encrypted history without a known hard owner retains normal initial routing for compatibility.
+Comradex cannot infer its issuer from ciphertext or soft affinity; the upstream may reject that
+initial request. The replay restrictions prevent subsequently trying that history on another account.
+
 Uploaded Codex files are also account-owned. Comradex records the creating account from successful `/files` responses, pins `/files/{file_id}/uploaded` finalization and Responses requests containing `file_id` to that account, and fails closed for conflicting or partially known multi-file ownership. Raw file IDs are hashed in a separate bounded `file-owners.json` snapshot and are never persisted directly; account authentication failures do not erase ownership.
 
 HTTP requests and the frame-aware WebSocket modes enforce file ownership found in request bodies. Raw WebSocket mode intentionally cannot inspect frame-local file IDs.
 
 ### Quotas, retries, and streaming
 
-Existing healthy bindings stay put even after usage crosses `switch_at`; the threshold controls only admission of new threads.
+Existing healthy bindings stay put after usage crosses `switch_at`, but fresh requests leave a soft binding at 100% usage. Hard account-owned continuations retain their owner.
 
 The default HTTP WebSocket bridge reconstructs a continued conversation from its cached input and completed output. When that history is portable, an exhausted previous account can be replaced automatically on the same client connection, including after a pre-output HTTP quota rejection or a bare quota error before `response.created`. The previous account remains preferred while healthy. Files, turn-state ownership, configured account pins, and nonportable context still prevent cross-account replay; missing cached history requires a full resend from the client. Account switching does not resume a partially delivered answer.
 
@@ -281,12 +289,19 @@ Existing owners remain usable, and an account in capacity backoff is still selec
 no alternative is eligible. `comradex status --json` exposes the soft deadline as
 `routing.account_states.<account>.capacity_backoff_until_unix`.
 
-A pre-output quota response, account-scoped connection-establishment failure, or selected gateway failure may use one alternate only for native Responses or idempotent methods, never for hard account-owned continuity. Native encrypted reasoning items can travel unchanged with a self-contained transcript. Compaction, unrelated encrypted tool output, hosted operation state, and durable operation metadata remain bound to the first account that actually receives them; a proven pre-dispatch connection failure does not create that binding. File ownership and previous-response or turn-state anchors remain separately enforced. Shared DNS and network-reachability failures remain account-neutral and do not rotate credentials. Successful or ambiguous Live Voice creation is never replayed. On HTTP, a managed-account 401 gets one same-account refresh retry, and a 401/403 never crosses accounts. No response is retried after visible output. When no alternate is eligible, the original upstream rejection and its `Retry-After` or reset headers are preserved; primary, secondary, and tertiary reset windows bound quota cooldowns.
+A pre-output quota response, account-scoped connection-establishment failure, or selected gateway failure may use one alternate only for portable native Responses or idempotent methods, never for hard account-owned continuity. Native reasoning, encrypted content, source-owned input item IDs, compaction, hosted operation state, and durable operation metadata prevent cross-account replay. Same-account authentication refresh preserves the original body and anchors. File ownership and previous-response or turn-state anchors remain separately enforced. Shared DNS and network-reachability failures remain account-neutral and do not rotate credentials. Successful or ambiguous Live Voice creation is never replayed. On HTTP, a managed-account 401 gets one same-account refresh retry, and a 401/403 never crosses accounts. No response is retried after visible output. When no alternate is eligible, the original upstream rejection and its `Retry-After` or reset headers are preserved; primary, secondary, and tertiary reset windows bound quota cooldowns.
 
-Native reasoning portability was qualified on the configured Codex backend with `gpt-6-astra`,
+`credit_balance_exhausted`, `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`,
+and `organization_usage_limit_exceeded` pass through without alternate-account replay or ordinary
+account-quota mutation, including HTTP 429 and streamed errors. Typed codes take precedence over
+generic quota wording. Incomplete, oversized, or encoded rejection bodies are forwarded without
+guessing their quota scope. Ordinary account quota errors retain normal failover.
+
+A historical native reasoning portability probe passed on the configured Codex backend with `gpt-6-astra`,
 two distinct managed identities, and an unchanged tool continuation on September 7, 2026. Both the
 same-account control and cross-account continuation completed the synthetic task. This observation
-does not establish a contract for every model, account combination, or encrypted payload. The ignored
+does not establish a contract for every model, account combination, or encrypted payload; routing now
+conservatively blocks cross-account replay of these items. The ignored
 `native_reasoning_live` integration test repeats that gate using normal Comradex credential resolution;
 set `COMRADEX_PROBE_MODEL` to the configured client model and explicitly authorize live account use
 before running `mbx test --test native_reasoning_live -- --ignored --nocapture`. It logs only safe
@@ -311,6 +326,15 @@ Select behavior with `proxy.responses_websocket_mode`:
 - `direct` keeps upstream WebSocket transport while routing and tracking each `response.create` frame independently. It supports multiplexed, out-of-order turns, reconnects only before visible output, refreshes an expired credential on the same account before considering one alternate, and can remove a stale `previous_response_id` only when the request contains a verified self-contained full resend. If safe internal replay is unavailable, it preserves Codex's canonical `previous_response_not_found` retry classifier while removing account-scoped details.
 
 Direct mode uses the explicit refresh-then-alternate sequence above. Live Voice upgrades are separate from these modes and remain raw, call-bound relays.
+
+Direct mode also supports native `response.steer`, `response.inject`, and multi-agent result
+continuations on their original physical upstream socket. Once a control chain starts, reconnect
+and replay are disabled. Controls must reference the current response; injection requires an
+explicitly enabled multi-agent create and matching function call identities. Backend acknowledgements
+and successor responses pass through unchanged. The chain is bounded to 32 controls, 8 MiB of control
+data, 128 responses, 90-second confirmation deadlines, and a 30-minute lifetime. A disconnect or
+expired confirmation fails closed because delivery may be unknown. The HTTP bridge rejects these
+native controls with guidance to use direct or raw mode; raw mode remains an uninspected relay.
 
 Both Responses WebSocket modes can use their one unused replay allowance after an explicit capacity rejection when the upstream emitted only empty `response.created`/`response.in_progress` metadata and the terminal proves zero output tokens. Missing usage, output items or deltas (including reasoning and tools), quota failures, and interrupted streams do not qualify. Eligible metadata is buffered for at most one second, 16 frames, or 64 KiB; any other event releases it immediately. A successful alternate therefore exposes one lifecycle with its original response ID and sequence numbers. When no alternate can be dispatched, the original lifecycle and rejection are preserved. File, turn-state, and nonportable context ownership restrictions still apply. Raw HTTP streaming does not use this accepted-work retry.
 

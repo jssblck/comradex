@@ -82,7 +82,6 @@ enum KeyKind {
     FileId,
     Type,
     Input,
-    EncryptedContent,
     Other,
 }
 
@@ -93,10 +92,6 @@ struct Container {
     account_scoped_file: bool,
     input_array: bool,
     native_input_item: bool,
-    reasoning: bool,
-    type_keys: usize,
-    encrypted_content: bool,
-    encrypted_content_string: bool,
 }
 
 #[derive(Default)]
@@ -128,8 +123,7 @@ struct MetadataScanner {
 
 impl MetadataScanner {
     fn finish(&mut self) {
-        // An unfinished item has not established that its encrypted payload is native
-        // reasoning; do not relax ownership for a truncated or malformed request.
+        // Do not relax ownership for a truncated or malformed request.
         self.nonportable_state |= self.in_string || !self.containers.is_empty();
         self.model_scan_incomplete |= self.in_string || !self.containers.is_empty();
     }
@@ -206,7 +200,6 @@ impl MetadataScanner {
                                 | KeyKind::PromptCacheKey
                                 | KeyKind::FileId
                                 | KeyKind::Type
-                                | KeyKind::EncryptedContent
                         )
                     });
                     self.string_is_key = self.capture_value.is_none()
@@ -234,10 +227,6 @@ impl MetadataScanner {
                         account_scoped_file: false,
                         input_array: false,
                         native_input_item,
-                        reasoning: false,
-                        type_keys: 0,
-                        encrypted_content: false,
-                        encrypted_content_string: false,
                     });
                     if is_client {
                         self.client_depth = Some(self.containers.len());
@@ -259,35 +248,22 @@ impl MetadataScanner {
                         account_scoped_file: false,
                         input_array,
                         native_input_item: false,
-                        reasoning: false,
-                        type_keys: 0,
-                        encrypted_content: false,
-                        encrypted_content_string: false,
                     });
                 }
                 b'}' | b']' => {
                     if self.client_depth == Some(self.containers.len()) {
                         self.client_depth = None;
                     }
-                    if let Some(container) = self.containers.pop() {
-                        // Only a self-contained native reasoning item directly in input may
-                        // carry portable ciphertext. Other encrypted payloads retain ownership.
-                        if container.reasoning || container.encrypted_content {
-                            self.nonportable_state |= !(container.native_input_item
-                                && container.reasoning
-                                && container.type_keys == 1
-                                && container.encrypted_content_string);
-                        }
-                        if container.account_scoped_file
-                            && let Some(file_id) = container.file_id
-                            && !self.file_ids.contains(&file_id)
-                        {
-                            if self.file_ids.len() < 32 {
-                                self.file_ids.push(file_id);
-                            } else {
-                                self.file_ids_overflow = true;
-                                self.disabled = true;
-                            }
+                    if let Some(container) = self.containers.pop()
+                        && container.account_scoped_file
+                        && let Some(file_id) = container.file_id
+                        && !self.file_ids.contains(&file_id)
+                    {
+                        if self.file_ids.len() < 32 {
+                            self.file_ids.push(file_id);
+                        } else {
+                            self.file_ids_overflow = true;
+                            self.disabled = true;
                         }
                     }
                     self.pending_value = None;
@@ -324,12 +300,6 @@ impl MetadataScanner {
                     .filter(|value| !value.is_empty() && value.len() <= MAX_MODEL_BYTES);
                 self.model_scan_incomplete |= self.model_token_overflow;
             }
-            if kind == KeyKind::EncryptedContent
-                && !self.token.is_empty()
-                && let Some(container) = self.containers.last_mut()
-            {
-                container.encrypted_content_string = true;
-            }
             if !self.token_overflow && !self.token.is_empty() {
                 let value = String::from_utf8(self.token.clone()).ok();
                 match kind {
@@ -347,10 +317,10 @@ impl MetadataScanner {
                         {
                             container.account_scoped_file =
                                 matches!(value.as_str(), "input_file" | "input_image");
-                            container.reasoning = value == "reasoning";
                             self.nonportable_state |= matches!(
                                 value.as_str(),
-                                "compaction"
+                                "reasoning"
+                                    | "compaction"
                                     | "item_reference"
                                     | "code_interpreter_call"
                                     | "computer_call"
@@ -363,11 +333,7 @@ impl MetadataScanner {
                             );
                         }
                     }
-                    KeyKind::Model
-                    | KeyKind::ClientMetadata
-                    | KeyKind::Other
-                    | KeyKind::Input
-                    | KeyKind::EncryptedContent => {}
+                    KeyKind::Model | KeyKind::ClientMetadata | KeyKind::Other | KeyKind::Input => {}
                 }
             }
         } else if self.string_is_key {
@@ -376,14 +342,17 @@ impl MetadataScanner {
             if !self.token_overflow
                 && (matches!(
                     self.token.as_slice(),
-                    b"operation_id"
+                    b"encrypted_content"
+                        | b"operation_id"
                         | b"codex_operation_id"
                         | b"internal_chat_message_metadata_passthrough"
-                ) || (at_root
-                    && matches!(
-                        self.token.as_slice(),
-                        b"conversation" | b"prompt" | b"turn_state"
-                    )))
+                ) || (self.containers.last().is_some_and(|v| v.native_input_item)
+                    && self.token == b"id")
+                    || (at_root
+                        && matches!(
+                            self.token.as_slice(),
+                            b"conversation" | b"prompt" | b"turn_state"
+                        )))
             {
                 self.nonportable_state = true;
             }
@@ -405,19 +374,9 @@ impl MetadataScanner {
             } else if !self.token_overflow && self.token == b"file_id" {
                 Some(KeyKind::FileId)
             } else if !self.token_overflow && self.token == b"type" {
-                if let Some(container) = self.containers.last_mut() {
-                    container.type_keys += 1;
-                }
                 Some(KeyKind::Type)
             } else if at_root && !self.token_overflow && self.token == b"input" {
                 Some(KeyKind::Input)
-            } else if !self.token_overflow && self.token == b"encrypted_content" {
-                if let Some(container) = self.containers.last_mut() {
-                    // Duplicate ciphertext properties are ambiguous to downstream parsers.
-                    self.nonportable_state |= container.encrypted_content;
-                    container.encrypted_content = true;
-                }
-                Some(KeyKind::EncryptedContent)
             } else {
                 Some(KeyKind::Other)
             };
@@ -1029,7 +988,7 @@ mod tests {
         scanner.feed(br#"{"input":[{"type":"reas"#);
         scanner.feed(br#"oning","encrypted_con"#);
         scanner.feed(br#"tent":"ciphertext"}]}"#);
-        assert!(!scanner.nonportable_state);
+        assert!(scanner.nonportable_state);
 
         let mut operation = MetadataScanner::default();
         operation
@@ -1053,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn native_reasoning_exception_is_item_scoped_and_chunk_independent() {
+    fn native_reasoning_is_account_bound_and_chunk_independent() {
         let native = serde_json::json!({"type":"reasoning","id":"rs_native","summary":[{"type":"summary_text","text":"synthetic summary"}],"encrypted_content":"x".repeat(2000)});
         for body in [
             serde_json::json!({"input":[native.clone()]}),
@@ -1065,7 +1024,7 @@ mod tests {
                 for chunk in bytes.chunks(size) {
                     scanner.feed(chunk);
                 }
-                assert!(!scanner.nonportable_state);
+                assert!(scanner.nonportable_state);
             }
         }
         for body in [
@@ -1097,5 +1056,27 @@ mod tests {
         unfinished.feed(br#"{"input":[{"type":"reasoning","encrypted_content":"opaque""#);
         unfinished.finish();
         assert!(unfinished.nonportable_state);
+    }
+
+    #[test]
+    fn responses_item_ids_are_account_bound_but_tool_call_ids_are_not() {
+        for item in [
+            serde_json::json!({"type":"message","id":"msg_owned","role":"assistant","content":[]}),
+            serde_json::json!({"id":"fc_owned","type":"function_call","call_id":"call_1","name":"f","arguments":"{}"}),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({"input":[item]})).unwrap();
+            for size in [1, 7, bytes.len()] {
+                let mut scanner = MetadataScanner::default();
+                for chunk in bytes.chunks(size) {
+                    scanner.feed(chunk);
+                }
+                scanner.finish();
+                assert!(scanner.nonportable_state);
+            }
+        }
+        let mut scanner = MetadataScanner::default();
+        scanner.feed(br#"{"input":[{"type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":{"id":"application_record"}}]}"#);
+        scanner.finish();
+        assert!(!scanner.nonportable_state);
     }
 }

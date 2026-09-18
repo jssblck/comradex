@@ -238,8 +238,13 @@ pub struct EventAssociation {
 pub enum FailureKind {
     None,
     Quota,
+    /// Positive organization/project/credit-scope evidence. Retrying another
+    /// account or treating this as ordinary account-plan exhaustion is unsafe.
+    ScopedQuota,
     Capacity,
-    Authentication { requires_reauthentication: bool },
+    Authentication {
+        requires_reauthentication: bool,
+    },
     PreviousResponseNotFound,
     Transient,
     Other,
@@ -613,7 +618,17 @@ impl ProtocolState {
             }
         };
 
-        let mode = if turn.previous_response_id.is_none() {
+        let same_account = target == ReplayTarget::SameAccountAfterRefresh
+            || failure == FailureKind::PreviousResponseNotFound;
+        if turn.analysis.has_nonportable_state && !same_account {
+            return Err(ReplayRefusal::HardContinuity);
+        }
+
+        let mode = if target == ReplayTarget::SameAccountAfterRefresh {
+            // Refreshing credentials does not change the issuer. Keep the
+            // request, including its continuation anchor, byte-for-byte.
+            ReplayMode::OriginalRequest
+        } else if turn.previous_response_id.is_none() {
             if failure == FailureKind::PreviousResponseNotFound {
                 return Err(ReplayRefusal::HardContinuity);
             }
@@ -962,11 +977,45 @@ fn is_quota_code(code: &str) -> bool {
     matches!(
         code,
         "rate_limit_exceeded"
+            | "usage_limit_exceeded"
             | "usage_limit_reached"
             | "insufficient_quota"
             | "quota_exceeded"
             | "usage_not_included"
     )
+}
+
+fn is_scoped_quota_code(code: &str) -> bool {
+    matches!(
+        code,
+        "credit_balance_exhausted"
+            | "organization_spend_limit_exceeded"
+            | "project_spend_limit_exceeded"
+            | "organization_usage_limit_exceeded"
+    )
+}
+
+/// Inspect only typed error fields, never free-form messages or request data.
+fn scoped_quota_code(event: &Value) -> Option<String> {
+    let response = event.get("response");
+    [
+        event.get("error"),
+        response.and_then(|value| value.get("error")),
+        Some(event),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|error| [error.get("code"), error.get("type")])
+    .flatten()
+    .chain(
+        response
+            .and_then(|value| value.get("incomplete_details"))
+            .and_then(|details| details.get("reason")),
+    )
+    .filter_map(Value::as_str)
+    .filter(|code| code.len() <= MAX_CLASSIFIED_CODE_BYTES)
+    .find(|code| is_scoped_quota_code(&code.to_ascii_lowercase()))
+    .map(str::to_ascii_lowercase)
 }
 
 fn is_quota_message(message: &str) -> bool {
@@ -1094,6 +1143,7 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
     let stale_message = normalized_message
         .strip_suffix('.')
         .unwrap_or(&normalized_message);
+    let scoped_code = scoped_quota_code(event);
 
     let previous_response_not_found = normalized_code == "previous_response_not_found"
         || (param == "previous_response_id"
@@ -1171,11 +1221,14 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
         && incomplete_message.is_none()
         && capacity_code.is_none()
         && capacity_message.is_none()
+        && scoped_code.is_none()
     {
         return FailureClassification::none();
     }
 
-    let kind = if previous_response_not_found {
+    let kind = if scoped_code.is_some() {
+        FailureKind::ScopedQuota
+    } else if previous_response_not_found {
         FailureKind::PreviousResponseNotFound
     } else if authentication {
         FailureKind::Authentication {
@@ -1197,7 +1250,7 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
     // Prefer the primary error code/message; fall back to the narrow
     // incomplete signal so quota terminals without an error object still
     // carry evidence.
-    let code = code.or_else(|| {
+    let code = scoped_code.or(code).or_else(|| {
         incomplete_code
             .or(capacity_code)
             .map(|value| value.to_ascii_lowercase())
@@ -1230,7 +1283,7 @@ pub fn classify_terminal_event(event: &Value) -> FailureClassification {
     let terminal = terminal_kind(event.get("type").and_then(Value::as_str));
     let classification = classify_failure(event);
     match classification.kind {
-        FailureKind::Quota | FailureKind::Capacity => match terminal {
+        FailureKind::Quota | FailureKind::ScopedQuota | FailureKind::Capacity => match terminal {
             Some(TerminalKind::Failed) | Some(TerminalKind::Incomplete) => classification,
             _ => FailureClassification {
                 kind: FailureKind::Other,
@@ -1249,7 +1302,7 @@ pub fn classify_terminal_event(event: &Value) -> FailureClassification {
 pub fn terminal_permits_affinity(classification: &FailureClassification) -> bool {
     !matches!(
         classification.kind,
-        FailureKind::Quota | FailureKind::Capacity
+        FailureKind::Quota | FailureKind::ScopedQuota | FailureKind::Capacity
     )
 }
 
@@ -1260,6 +1313,15 @@ pub fn terminal_permits_affinity(classification: &FailureClassification) -> bool
 /// A body numeric 200 never counts as success here; only the terminal
 /// classification matters to the caller.
 pub fn classify_http_json_body(value: &Value) -> FailureClassification {
+    // HTTP error objects may put the error code in `type`; that does not
+    // make them Responses protocol events.
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| is_scoped_quota_code(&kind.to_ascii_lowercase()))
+    {
+        return classify_failure(value);
+    }
     if value.get("type").and_then(Value::as_str).is_some() {
         return classify_terminal_event(value);
     }
@@ -1280,9 +1342,11 @@ pub fn classify_http_json_body(value: &Value) -> FailureClassification {
             // terminal; otherwise there is nothing to classify.
             if response.get("error").is_some_and(|error| error.is_object())
                 || value.get("error").is_some_and(|error| error.is_object())
+                || scoped_quota_code(value).is_some()
             {
                 let synthetic = serde_json::json!({
                     "type": "error",
+                    "code": value.get("code").cloned().unwrap_or(serde_json::Value::Null),
                     "status": value.get("status").cloned()
                         .or_else(|| value.get("status_code").cloned())
                         .unwrap_or(serde_json::Value::Null),
@@ -1443,21 +1507,19 @@ fn contains_nonportable_state(value: &Value, at_root: bool, native_input_item: b
             .iter()
             .any(|value| contains_nonportable_state(value, false, false)),
         Value::Object(object) => {
-            let portable_reasoning = native_input_item
-                && object.get("type").and_then(Value::as_str) == Some("reasoning")
-                && object
-                    .get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty());
+            // Native Responses item IDs and ciphertext are issuer-owned. A
+            // successful replay on one backend is not a portability contract.
+            if native_input_item && object.contains_key("id") {
+                return true;
+            }
             if object.keys().any(|key| {
-                (key == "encrypted_content" && !portable_reasoning)
-                    || matches!(
-                        key.as_str(),
-                        "operation_id"
-                            | "codex_operation_id"
-                            | "internal_chat_message_metadata_passthrough"
-                    )
-                    || (at_root && matches!(key.as_str(), "conversation" | "prompt" | "turn_state"))
+                matches!(
+                    key.as_str(),
+                    "encrypted_content"
+                        | "operation_id"
+                        | "codex_operation_id"
+                        | "internal_chat_message_metadata_passthrough"
+                ) || (at_root && matches!(key.as_str(), "conversation" | "prompt" | "turn_state"))
             }) {
                 return true;
             }
@@ -1465,20 +1527,20 @@ fn contains_nonportable_state(value: &Value, at_root: bool, native_input_item: b
                 .get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|item_type| {
-                    (item_type == "reasoning" && !portable_reasoning)
-                        || matches!(
-                            item_type,
-                            "compaction"
-                                | "item_reference"
-                                | "code_interpreter_call"
-                                | "computer_call"
-                                | "computer_call_output"
-                                | "file_search_call"
-                                | "image_generation_call"
-                                | "tool_search_call"
-                                | "tool_search_output"
-                                | "web_search_call"
-                        )
+                    matches!(
+                        item_type,
+                        "reasoning"
+                            | "compaction"
+                            | "item_reference"
+                            | "code_interpreter_call"
+                            | "computer_call"
+                            | "computer_call_output"
+                            | "file_search_call"
+                            | "image_generation_call"
+                            | "tool_search_call"
+                            | "tool_search_output"
+                            | "web_search_call"
+                    )
                 })
             {
                 return true;
@@ -2453,7 +2515,7 @@ mod tests {
     }
 
     #[test]
-    fn native_reasoning_is_portable_without_changing_anchor_policy() {
+    fn native_reasoning_retains_ownership_after_removing_a_stale_anchor() {
         let frame = json!({
             "type":"response.create",
             "previous_response_id":"resp_old",
@@ -2463,15 +2525,122 @@ mod tests {
             ]
         });
         let analysis = analyze_response_create(&frame, ProtocolLimits::default()).unwrap();
-        assert!(!analysis.has_nonportable_state);
+        assert!(analysis.has_nonportable_state);
         assert_eq!(analysis.previous_response_id.as_deref(), Some("resp_old"));
         assert_eq!(analysis.full_resend, FullResendSafety::Eligible);
 
         let fresh =
             fresh_replay_without_previous_response(&frame, ProtocolLimits::default()).unwrap();
         assert!(fresh.get("previous_response_id").is_none());
-        assert!(!frame_contains_nonportable_state(&fresh));
+        assert!(frame_contains_nonportable_state(&fresh));
         assert_eq!(fresh["input"], frame["input"]);
+    }
+
+    #[test]
+    fn issuer_owned_items_block_account_switches_but_preserve_auth_refresh() {
+        for item in [
+            json!({"type":"reasoning","encrypted_content":"ciphertext"}),
+            json!({"type":"message","id":"msg_owned","role":"assistant","content":[]}),
+            json!({"type":"function_call","id":"fc_owned","call_id":"call_1","name":"f","arguments":"{}"}),
+        ] {
+            let frame = json!({
+                "type":"response.create",
+                "previous_response_id":"resp_owner",
+                "input":[item, {"role":"user","content":"continue"}]
+            });
+            let mut protocol = state();
+            let turn = protocol.admit_response_create(&frame).unwrap();
+            for failure in [
+                FailureKind::Quota,
+                FailureKind::Capacity,
+                FailureKind::Transient,
+                FailureKind::Authentication {
+                    requires_reauthentication: true,
+                },
+            ] {
+                assert_eq!(
+                    protocol.replay_plan(turn, failure, ReplayContext::default()),
+                    Err(ReplayRefusal::HardContinuity)
+                );
+            }
+            let plan = protocol
+                .prepare_replay_plan(
+                    turn,
+                    FailureKind::Authentication {
+                        requires_reauthentication: false,
+                    },
+                    ReplayContext::default(),
+                )
+                .unwrap();
+            assert_eq!(plan.target, ReplayTarget::SameAccountAfterRefresh);
+            assert_eq!(plan.mode, ReplayMode::OriginalRequest);
+            assert_eq!(
+                protocol.turn(turn).unwrap().previous_response_id(),
+                Some("resp_owner")
+            );
+        }
+    }
+
+    #[test]
+    fn client_tool_call_identity_is_distinct_from_a_responses_item_id() {
+        let frame = create(json!([
+            {"type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":{"id":"application_record"}}
+        ]));
+        assert!(!frame_contains_nonportable_state(&frame));
+    }
+
+    #[test]
+    fn scoped_quota_codes_override_status_and_message_without_replay() {
+        for code in [
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+        ] {
+            for event in [
+                json!({"type":"error","status":429,"error":{"code":code,"message":"The usage limit has been reached"}}),
+                json!({"type":"response.failed","response":{"id":"resp_refused","error":{"code":code}}}),
+                json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":code}}}),
+                json!({"type":"error","code":code,"status":402}),
+            ] {
+                let classified = classify_terminal_event(&event);
+                assert_eq!(classified.kind, FailureKind::ScopedQuota, "{event}");
+                assert!(!terminal_permits_affinity(&classified));
+                let mut protocol = state();
+                let turn = protocol
+                    .admit_response_create(&create(json!("hello")))
+                    .unwrap();
+                assert_eq!(
+                    protocol.replay_plan(turn, classified.kind, ReplayContext::default()),
+                    Err(ReplayRefusal::UnsupportedFailure)
+                );
+            }
+            assert_eq!(
+                classify_http_json_body(&json!({"error":{"code":code}})).kind,
+                FailureKind::ScopedQuota
+            );
+            assert_eq!(
+                classify_http_json_body(&json!({"code":code})).kind,
+                FailureKind::ScopedQuota
+            );
+        }
+        for code in [
+            "usage_limit_exceeded",
+            "rate_limit_exceeded",
+            "slow_down",
+            "unknown_code",
+        ] {
+            assert_eq!(
+                classify_terminal_event(
+                    &json!({"type":"error","status":429,"error":{"code":code}})
+                )
+                .kind,
+                FailureKind::Quota
+            );
+        }
+        assert_eq!(classify_terminal_event(&json!({"type":"response.completed","response":{"error":{"code":"project_spend_limit_exceeded"}}})).kind,
+            FailureKind::Other);
     }
 
     #[test]
