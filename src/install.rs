@@ -7,6 +7,170 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, value};
 
+const DESKTOP_ENV: &str = "CODEX_API_BASE_URL";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DesktopInstallRecord {
+    installed_url: String,
+    // None and Some("") are deliberately distinct launchd environment states.
+    previous_url: Option<String>,
+}
+
+trait DesktopEnvironment {
+    fn get(&self) -> Result<Option<String>>;
+    fn set(&self, value: Option<&str>) -> Result<()>;
+}
+
+struct LaunchctlEnvironment;
+
+impl DesktopEnvironment for LaunchctlEnvironment {
+    fn get(&self) -> Result<Option<String>> {
+        if !cfg!(target_os = "macos") {
+            bail!("Desktop environment installation requires macOS")
+        }
+        let output = std::process::Command::new("/bin/launchctl")
+            .args(["getenv", DESKTOP_ENV])
+            .output()
+            .context("read Desktop launch environment")?;
+        if !output.status.success() {
+            bail!("launchctl getenv failed; Desktop environment was not changed")
+        }
+        decode_launchctl_environment(output.stdout)
+    }
+
+    fn set(&self, value: Option<&str>) -> Result<()> {
+        if !cfg!(target_os = "macos") {
+            bail!("Desktop environment installation requires macOS")
+        }
+        let mut command = std::process::Command::new("/bin/launchctl");
+        match value {
+            Some(value) => {
+                command.args(["setenv", DESKTOP_ENV, value]);
+            }
+            None => {
+                command.args(["unsetenv", DESKTOP_ENV]);
+            }
+        }
+        let output = command
+            .output()
+            .context("update Desktop launch environment")?;
+        if !output.status.success() {
+            bail!("launchctl failed to update Desktop environment; recovery record retained")
+        }
+        Ok(())
+    }
+}
+
+fn decode_launchctl_environment(stdout: Vec<u8>) -> Result<Option<String>> {
+    // launchctl succeeds without output for an absent key; an empty value emits a newline.
+    if stdout.is_empty() {
+        return Ok(None);
+    }
+    let mut value = String::from_utf8(stdout).context("Desktop environment is not UTF-8")?;
+    // launchctl appends one newline; do not trim user-owned whitespace.
+    if value.ends_with('\n') {
+        value.pop();
+    }
+    Ok(Some(value))
+}
+
+pub fn install_desktop(record_path: &Path, url: &str) -> Result<()> {
+    install_desktop_with(&LaunchctlEnvironment, record_path, url)
+}
+
+pub fn check_desktop_install(record_path: &Path, url: &str) -> Result<()> {
+    prepare_desktop_install(&LaunchctlEnvironment, record_path, url).map(|_| ())
+}
+
+pub fn uninstall_desktop(record_path: &Path) -> Result<()> {
+    uninstall_desktop_with(&LaunchctlEnvironment, record_path)
+}
+
+fn desktop_record(path: &Path) -> Result<Option<DesktopInstallRecord>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).context("parse Desktop recovery record")?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read Desktop recovery record"),
+    }
+}
+
+fn prepare_desktop_install(
+    environment: &impl DesktopEnvironment,
+    path: &Path,
+    url: &str,
+) -> Result<(DesktopInstallRecord, Option<String>)> {
+    let uri: hyper::Uri = url.parse().context("invalid Desktop backend URL")?;
+    let secret = uri
+        .path()
+        .strip_suffix("/backend-api")
+        .and_then(|path| path.strip_prefix('/'));
+    if uri.scheme_str() != Some("http")
+        || uri.host() != Some("localhost")
+        || uri.port_u16().is_none_or(|port| port == 0)
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+        || uri.query().is_some()
+        || secret.is_none_or(|secret| secret.len() < 16 || secret.contains('/'))
+    {
+        bail!("Desktop backend URL must be an authenticated localhost backend path")
+    }
+    let current = environment.get()?;
+    let record = match desktop_record(path)? {
+        Some(record) => {
+            if record.installed_url != url {
+                bail!("uninstall the existing Desktop integration before changing its URL")
+            }
+            if current.as_deref() != Some(&record.installed_url) && current != record.previous_url {
+                bail!("CODEX_API_BASE_URL changed since install; refusing to overwrite it")
+            }
+            record
+        }
+        None => DesktopInstallRecord {
+            installed_url: url.to_owned(),
+            previous_url: current.clone(),
+        },
+    };
+    Ok((record, current))
+}
+
+fn install_desktop_with(
+    environment: &impl DesktopEnvironment,
+    path: &Path,
+    url: &str,
+) -> Result<()> {
+    let (record, current) = prepare_desktop_install(environment, path, url)?;
+    // Persist recovery first so a crash or failed launchctl never loses the original value.
+    atomic_write(path, &serde_json::to_vec_pretty(&record)?)?;
+    if current.as_deref() != Some(url) {
+        environment.set(Some(url))?;
+    }
+    if environment.get()?.as_deref() != Some(url) {
+        bail!("Desktop environment changed during install; recovery record retained")
+    }
+    Ok(())
+}
+
+fn uninstall_desktop_with(environment: &impl DesktopEnvironment, path: &Path) -> Result<()> {
+    let Some(record) = desktop_record(path)? else {
+        return Ok(());
+    };
+    let current = environment.get()?;
+    if current != record.previous_url {
+        if current.as_deref() != Some(&record.installed_url) {
+            bail!("CODEX_API_BASE_URL changed since install; refusing to overwrite it")
+        }
+        environment.set(record.previous_url.as_deref())?;
+    }
+    if environment.get()? != record.previous_url {
+        bail!("Desktop environment changed during restore; recovery record retained")
+    }
+    fs::remove_file(path).context("remove Desktop recovery record")?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstallRecord {
     pub codex_config: PathBuf,
@@ -233,6 +397,126 @@ fn recorded_destination(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn desktop_launchctl_output_preserves_absent_empty_and_trailing_newlines() {
+        assert_eq!(decode_launchctl_environment(vec![]).unwrap(), None);
+        assert_eq!(
+            decode_launchctl_environment(b"\n".to_vec()).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            decode_launchctl_environment(b" value \n\n".to_vec()).unwrap(),
+            Some(" value \n".into())
+        );
+    }
+    struct MockDesktopEnvironment {
+        value: std::cell::RefCell<Option<String>>,
+        fail_set: std::cell::Cell<bool>,
+    }
+
+    impl DesktopEnvironment for MockDesktopEnvironment {
+        fn get(&self) -> Result<Option<String>> {
+            Ok(self.value.borrow().clone())
+        }
+        fn set(&self, value: Option<&str>) -> Result<()> {
+            if self.fail_set.get() {
+                bail!("mock launchctl failure");
+            }
+            *self.value.borrow_mut() = value.map(str::to_owned);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn desktop_install_restores_exact_unset_empty_and_whitespace_values() {
+        for original in [
+            None,
+            Some(String::new()),
+            Some("  https://old.example/backend-api\n ".into()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("desktop.json");
+            let environment = MockDesktopEnvironment {
+                value: std::cell::RefCell::new(original.clone()),
+                fail_set: std::cell::Cell::new(false),
+            };
+            for _ in 0..2 {
+                install_desktop_with(
+                    &environment,
+                    &record,
+                    "http://localhost:8000/0123456789abcdef/backend-api",
+                )
+                .unwrap();
+            }
+            uninstall_desktop_with(&environment, &record).unwrap();
+            assert_eq!(environment.get().unwrap(), original);
+            assert!(!record.exists());
+            uninstall_desktop_with(&environment, &record).unwrap();
+        }
+    }
+
+    #[test]
+    fn desktop_foreign_changes_preserve_environment_and_recovery_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("desktop.json");
+        let environment = MockDesktopEnvironment {
+            value: std::cell::RefCell::new(None),
+            fail_set: std::cell::Cell::new(false),
+        };
+        install_desktop_with(
+            &environment,
+            &record,
+            "http://localhost:8000/0123456789abcdef/backend-api",
+        )
+        .unwrap();
+        environment.set(Some("https://foreign.example")).unwrap();
+        assert!(
+            install_desktop_with(
+                &environment,
+                &record,
+                "http://localhost:8000/0123456789abcdef/backend-api"
+            )
+            .is_err()
+        );
+        assert!(uninstall_desktop_with(&environment, &record).is_err());
+        assert_eq!(
+            environment.get().unwrap().as_deref(),
+            Some("https://foreign.example")
+        );
+        assert!(record.exists());
+    }
+
+    #[test]
+    fn desktop_failed_environment_write_keeps_recoverable_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("desktop.json");
+        let environment = MockDesktopEnvironment {
+            value: std::cell::RefCell::new(Some(String::new())),
+            fail_set: std::cell::Cell::new(true),
+        };
+        assert!(
+            install_desktop_with(
+                &environment,
+                &record,
+                "http://localhost:8000/0123456789abcdef/backend-api"
+            )
+            .is_err()
+        );
+        assert!(record.exists());
+        environment.fail_set.set(false);
+        install_desktop_with(
+            &environment,
+            &record,
+            "http://localhost:8000/0123456789abcdef/backend-api",
+        )
+        .unwrap();
+        environment.fail_set.set(true);
+        assert!(uninstall_desktop_with(&environment, &record).is_err());
+        assert!(record.exists());
+        environment.fail_set.set(false);
+        uninstall_desktop_with(&environment, &record).unwrap();
+        assert_eq!(environment.get().unwrap(), Some(String::new()));
+    }
     #[test]
     fn install_round_trip_preserves_everything_else() {
         let dir = tempfile::tempdir().unwrap();

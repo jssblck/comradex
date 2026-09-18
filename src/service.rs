@@ -24,16 +24,21 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
+fn configured_listener_addresses(config: &crate::config::Config) -> Vec<SocketAddr> {
+    config
+        .listeners
+        .values()
+        .chain(config.proxy.desktop.iter())
+        .map(|listener| listener.address)
+        .collect()
+}
+
 pub fn install(config_path: &Path, state_dir: &Path) -> Result<PathBuf> {
     platform_check()?;
     let config_path = fs::canonicalize(config_path)
         .with_context(|| format!("resolve {}", config_path.display()))?;
     let config = crate::config::Config::load(&config_path)?;
-    let listener_addresses: Vec<_> = config
-        .listeners
-        .values()
-        .map(|listener| listener.address)
-        .collect();
+    let listener_addresses: Vec<_> = configured_listener_addresses(&config);
     if listener_addresses.iter().any(|address| address.port() == 0) {
         bail!("service installation requires fixed non-zero listener ports")
     }
@@ -351,12 +356,13 @@ pub fn while_daemon_stopped<T>(action: impl FnOnce() -> Result<T>) -> Result<T> 
             format!("no --config argument recorded in {}", plist_path.display())
         })?;
         let config = crate::config::Config::load(&config_path)?;
-        let listener_addresses: Vec<_> = config
-            .listeners
-            .values()
-            .map(|listener| listener.address)
-            .collect();
+        let listener_addresses: Vec<_> = configured_listener_addresses(&config);
         let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
+        if config.proxy.desktop.is_some() && service_nonce.is_none() {
+            bail!(
+                "Desktop readiness requires a service nonce; run `comradex service install` to update the legacy LaunchAgent"
+            )
+        }
 
         maintenance_transaction(
             true,
@@ -493,15 +499,16 @@ fn installed_service() -> Result<InstalledService> {
         )
     }
     let config = crate::config::Config::load(&config_path)?;
-    let listener_addresses: Vec<_> = config
-        .listeners
-        .values()
-        .map(|listener| listener.address)
-        .collect();
+    let listener_addresses: Vec<_> = configured_listener_addresses(&config);
     if listener_addresses.iter().any(|address| address.port() == 0) {
         bail!("installed service configuration requires fixed non-zero listener ports")
     }
     let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
+    if config.proxy.desktop.is_some() && service_nonce.is_none() {
+        bail!(
+            "Desktop readiness requires a service nonce; run `comradex service install` to update the legacy LaunchAgent"
+        )
+    }
     Ok(InstalledService {
         plist_path,
         listener_addresses,
@@ -1452,6 +1459,46 @@ mod tests {
                 .unwrap();
         });
         assert!(listeners_ready(&[wildcard], Some("test-nonce")));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn optional_desktop_listener_is_required_for_service_readiness() {
+        use crate::config::{Config, ListenerConfig, ProxyConfig};
+        use std::collections::BTreeMap;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let desktop = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let desktop_address = desktop.local_addr().unwrap();
+        drop(desktop);
+        let config = Config {
+            proxy: ProxyConfig {
+                desktop: Some(ListenerConfig {
+                    address: desktop_address,
+                    pool: "default".into(),
+                }),
+                ..Default::default()
+            },
+            listeners: BTreeMap::from([(
+                "default".into(),
+                ListenerConfig {
+                    address,
+                    pool: "default".into(),
+                },
+            )]),
+            pools: BTreeMap::new(),
+            accounts: BTreeMap::new(),
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}").unwrap();
+        });
+        assert!(!listeners_ready(
+            &configured_listener_addresses(&config),
+            Some("test-nonce")
+        ));
         server.join().unwrap();
     }
 

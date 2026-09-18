@@ -247,6 +247,24 @@ fn auth_failure_recovery(current: &Credentials, failed: &Credentials) -> AuthFai
 }
 
 impl Resolver {
+    /// Inspect current credentials without refreshing tokens or starting a login.
+    pub fn credentials_usable(&self, account: &AccountConfig, inbound: &HeaderMap) -> bool {
+        match account {
+            AccountConfig::Inbound => inbound
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .is_some_and(|value| !value.trim().is_empty()),
+            AccountConfig::CodexHome { path } => {
+                let Ok(document) = read_auth(&path.join("auth.json")) else {
+                    return false;
+                };
+                access_token_expiration(&document.value, unix_now())
+                    .is_none_or(|expiration| expiration > unix_now())
+                    && !self.health.rejected(path, &document.credentials)
+            }
+        }
+    }
     pub fn new(config: &Config) -> Self {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
