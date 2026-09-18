@@ -261,8 +261,8 @@ async fn capacity_body_inspection_leaves_auth_status_and_oversized_body_untouche
             )
             .await
             .unwrap();
-        let (response, failure) = inspect_rejection_body(response).await.unwrap();
-        assert_eq!(failure, None);
+        let (response, inspection) = inspect_rejection_body(response).await.unwrap();
+        assert_eq!(inspection.failure, None);
         assert_eq!(response.status(), status);
         assert_eq!(response.headers()["x-upstream-marker"], "unchanged");
         assert_eq!(
@@ -320,11 +320,12 @@ async fn capacity_inspection_deadline_resumes_body_and_preserves_trailers() {
         )
         .await
         .unwrap();
-    let (response, failure) = inspect_rejection_body(response).await.unwrap();
+    let (response, inspection) = inspect_rejection_body(response).await.unwrap();
     assert_eq!(
-        failure, None,
+        inspection.failure, None,
         "inspection must end before the delayed terminal arrives"
     );
+    assert!(!inspection.permits_account_failure());
     let collected = response.into_body().collect().await.unwrap();
     assert_eq!(collected.trailers().unwrap()["x-final-marker"], "preserved");
     assert_eq!(

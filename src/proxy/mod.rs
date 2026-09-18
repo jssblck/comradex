@@ -15,6 +15,9 @@ mod context_ws_tests;
 mod headers;
 #[cfg(test)]
 mod http_continuity_tests;
+mod native_control;
+#[cfg(test)]
+mod native_control_tests;
 mod replay_body;
 #[allow(dead_code)]
 mod sse;
@@ -117,6 +120,48 @@ fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
             | metadata::AffinityKind::PreviousResponse
             | metadata::AffinityKind::File
     )
+}
+
+async fn soft_affinity_key(
+    store: &AffinityStore,
+    keys: &[(metadata::AffinityKind, crate::routing::ThreadKey)],
+) -> Option<crate::routing::ThreadKey> {
+    let mut candidates: Vec<_> = keys
+        .iter()
+        .filter_map(|(kind, key)| {
+            kind.soft_routing_priority().map(|priority| {
+                let key = if *kind == metadata::AffinityKind::ParentThread {
+                    // Router selection itself prebinds fresh keys, before the
+                    // response success gate. Parent placement must not do so.
+                    key.clone().lookup_only()
+                } else {
+                    key.clone()
+                };
+                (priority, key)
+            })
+        })
+        .collect();
+    candidates.sort_by_key(|(priority, _)| *priority);
+    for (_, key) in &candidates {
+        if store.get(key).await.is_some() {
+            return Some((*key).clone());
+        }
+    }
+    candidates.first().map(|(_, key)| (*key).clone())
+}
+
+fn affinity_bind_key(
+    kind: metadata::AffinityKind,
+    key: &crate::routing::ThreadKey,
+    hard_owner: bool,
+) -> Option<crate::routing::ThreadKey> {
+    kind.is_bind_target().then(|| {
+        if hard_owner && kind.is_shared_cohort() {
+            key.clone().preserve_existing()
+        } else {
+            key.clone()
+        }
+    })
 }
 
 /// Emit the `selected vs wired + epoch` line used for post-hoc stale-dispatch detection.
@@ -1454,14 +1499,7 @@ impl App {
         let mut non_previous_hard_owner = false;
         let mut known_file_owners = 0usize;
         let mut missing_hard_owner = false;
-        let soft_routing_key = affinity_keys
-            .iter()
-            .filter_map(|(kind, key)| {
-                kind.soft_routing_priority()
-                    .map(|priority| (priority, key.clone()))
-            })
-            .min_by_key(|(priority, _)| *priority)
-            .map(|(_, key)| key);
+        let soft_routing_key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
         for (kind, key) in &affinity_keys {
             let binding = if *kind == metadata::AffinityKind::File {
                 self.file_owners.get(key).await
@@ -1736,8 +1774,8 @@ impl App {
             // collectors below. Streaming responses release it when this function returns.
             match result {
                 Ok(response) => {
-                    let (mut response, body_failure) = inspect_rejection_body(response).await?;
-                    let capacity = body_failure == Some(FailureKind::Capacity);
+                    let (mut response, inspection) = inspect_rejection_body(response).await?;
+                    let capacity = inspection.failure == Some(FailureKind::Capacity);
                     if capacity {
                         self.router.capacity_failure(&account).await;
                         response
@@ -1809,6 +1847,7 @@ impl App {
                                             wired.as_deref(),
                                         );
                                         if !hard_owner
+                                            && !nonportable_payload
                                             && !selected.bound
                                             && let Some(alternate) = self
                                                 .router
@@ -1853,14 +1892,14 @@ impl App {
                     }
                     if status.is_success() {
                         for (kind, key) in &affinity_keys {
-                            if *kind != metadata::AffinityKind::File
+                            if let Some(key) = affinity_bind_key(*kind, key, hard_owner)
                                 && !(materialized_previous_owner
                                     && *kind == metadata::AffinityKind::PreviousResponse)
                             {
                                 if defer_affinity {
-                                    deferred_affinity.push(key.clone());
+                                    deferred_affinity.push(key);
                                 } else {
-                                    self.router.bind(key.clone(), &account).await;
+                                    self.router.bind(key, &account).await;
                                 }
                             }
                         }
@@ -1894,7 +1933,8 @@ impl App {
                             .map_file_finalize_response(response, &account, &file_id)
                             .await;
                     }
-                    let retry = retryable_http_status(status, &method, &path);
+                    let retry = inspection.permits_account_failure()
+                        && retryable_http_status(status, &method, &path);
                     if retry && !capacity {
                         if status == StatusCode::TOO_MANY_REQUESTS
                             || status == StatusCode::PAYMENT_REQUIRED
@@ -2317,8 +2357,10 @@ impl App {
                     if frame_type != Some("response.create") {
                         send_ws_error(
                             &control,
-                            "invalid_request_error",
-                            "expected response.create",
+                            if native_control::is_control(frame_type) { "native_control_unsupported" } else { "invalid_request_error" },
+                            if native_control::is_control(frame_type) {
+                                "native Responses controls require responses_websocket_mode = direct or raw; HTTP bridge cannot preserve the upstream socket"
+                            } else { "expected response.create" },
                         )
                         .await;
                         continue;
@@ -2700,7 +2742,7 @@ impl App {
             .map(|value| (value.kind, self.router.affinity.key(&value.namespaced())))
             .collect();
         let mut hard_bound_account: Option<String> = None;
-        let mut soft_bound_account: Option<String> = None;
+        let soft_key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
         let mut hard_owner = false;
         let mut non_previous_hard_owner = false;
         let mut known_file_owners = 0usize;
@@ -2730,8 +2772,6 @@ impl App {
                 hard_owner = true;
                 non_previous_hard_owner |= *kind != metadata::AffinityKind::PreviousResponse;
                 hard_bound_account = Some(binding.account_id.clone());
-            } else if soft_bound_account.is_none() {
-                soft_bound_account = Some(binding.account_id.clone());
             }
             if *kind == metadata::AffinityKind::File {
                 known_file_owners += 1;
@@ -2762,7 +2802,12 @@ impl App {
                 .select_exact(pool, account)
                 .await
                 .context("required continuity account is unavailable")?
-        } else if let Some(account) = soft_bound_account.as_deref().or(preferred_account) {
+        } else if soft_key.is_some() {
+            self.router
+                .select(&listener.pool, pool, soft_key, None)
+                .await
+                .context("no eligible account for fresh direct WebSocket frame")?
+        } else if let Some(account) = preferred_account {
             self.router
                 .select_preferred(&listener.pool, pool, account)
                 .await
@@ -2775,8 +2820,8 @@ impl App {
         };
         let mut soft_keys = Vec::new();
         for (kind, key) in &affinity_keys {
-            if *kind != metadata::AffinityKind::File {
-                soft_keys.push(key.clone());
+            if let Some(key) = affinity_bind_key(*kind, key, hard_owner) {
+                soft_keys.push(key);
             }
         }
         Ok(WebSocketFrameRoute {
@@ -2934,8 +2979,8 @@ impl App {
                     }
                 }
             }
-            let (response, body_failure) = inspect_rejection_body(response).await?;
-            let capacity = body_failure == Some(FailureKind::Capacity);
+            let (response, inspection) = inspect_rejection_body(response).await?;
+            let capacity = inspection.failure == Some(FailureKind::Capacity);
             let status = response.status();
             self.router.end(account).await;
             if capacity {
@@ -2972,7 +3017,7 @@ impl App {
                     }
                 }
             }
-            if capacity {
+            if capacity || !inspection.permits_account_failure() {
                 // The body classification takes precedence over quota/gateway status.
             } else if is_quota_status(status) {
                 self.router
@@ -3018,6 +3063,7 @@ impl App {
         let mut missing_created_deadline: Option<tokio::time::Instant> = None;
         let mut upstream_idle_deadlines = HashMap::<TurnId, tokio::time::Instant>::new();
         let mut queued_creates = VecDeque::<Message>::new();
+        let mut native_candidate: Option<native_control::Candidate> = None;
         loop {
             let earliest_idle_deadline = earliest_turn_deadline(&upstream_idle_deadlines);
             let lifecycle_deadline = turns
@@ -3044,6 +3090,7 @@ impl App {
                     }
                 }
                 _ = wait_for_optional_deadline(missing_created_deadline) => {
+                    native_candidate = None;
                     let close_downstream = self
                         .recover_or_settle_direct_end(
                             &mut protocol,
@@ -3065,6 +3112,7 @@ impl App {
                     if close_downstream { break; }
                 }
                 _ = wait_for_optional_deadline(earliest_idle_deadline.map(|(_, deadline)| deadline)) => {
+                    native_candidate = None;
                     let close_downstream = self
                         .recover_or_settle_direct_end(
                             &mut protocol,
@@ -3098,6 +3146,32 @@ impl App {
                     let client_message = client_message.context("read downstream Responses frame")?;
                     if let Message::Text(text) = &client_message {
                         let parsed = serde_json::from_str::<serde_json::Value>(text.as_str()).ok();
+                        if native_control::is_control(parsed.as_ref().and_then(|value| value.get("type")).and_then(serde_json::Value::as_str))
+                            || parsed.as_ref().is_some_and(|value| native_candidate.as_ref().is_some_and(|candidate| candidate.is_result_continuation(value))) {
+                            if protocol.pending_len() > 1 || awaiting_response_created.is_some() || !queued_creates.is_empty() {
+                                send_direct_error(&mut client, "native_control_ambiguous", "native controls require one accepted response and no queued creates").await?;
+                                continue;
+                            }
+                            let Some(candidate) = native_candidate.as_ref() else {
+                                send_direct_error(&mut client, "native_control_no_owner", "native control requires a response accepted on this socket").await?;
+                                continue;
+                            };
+                            if protocol.pending().any(|turn| turn.response_id() != Some(candidate.response_id())) {
+                                send_direct_error(&mut client, "native_control_ambiguous", "another response remains active on this socket").await?;
+                                continue;
+                            }
+                            if let Err(reason) = candidate.validate_control(parsed.as_ref().unwrap()) {
+                                send_direct_error(&mut client, "native_control_invalid", reason).await?;
+                                continue;
+                            }
+                            self.flush_direct_lifecycle(&mut protocol, &mut turns, &mut client, &account, None, true).await?;
+                            // This transition is deliberately irreversible. The owned relay has no
+                            // account selection, socket replacement, or HTTP replay path.
+                            return self.run_native_control_socket(
+                                &mut client, &mut upstream, &upstream_credentials, &account,
+                                native_candidate.take().unwrap(), client_message,
+                            ).await;
+                        }
                         if parsed.as_ref().and_then(|value| value.get("type")).and_then(serde_json::Value::as_str)
                             == Some("response.create")
                         {
@@ -3185,6 +3259,7 @@ impl App {
                                 lease.replace_with_route(&route).await;
                                 upstream = replacement.socket;
                                 upstream_credentials = replacement.credentials;
+                                native_candidate = None;
                             }
                             let analysis = match analyze_response_create(
                                 &routing_value,
@@ -3253,6 +3328,7 @@ impl App {
                     match upstream_message {
                         Some(Ok(message)) => {
                             if let Message::Close(frame) = &message {
+                                native_candidate = None;
                                 let end = UpstreamEnd::Close {
                                     code: frame.as_ref().map_or(1005, |frame| u16::from(frame.code)),
                                 };
@@ -3352,6 +3428,7 @@ impl App {
                                     lease.replace(account.clone()).await;
                                     upstream = replacement.socket;
                                     upstream_credentials = replacement.credentials;
+                                    native_candidate = None;
                                     awaiting_response_created = Some(turn_id);
                                     missing_created_deadline = Some(
                                         tokio::time::Instant::now()
@@ -3382,6 +3459,15 @@ impl App {
                             let association = protocol
                                 .observe_upstream_event(&event, anchor_hint.as_deref())
                                 .map_err(|error| anyhow::anyhow!("associate upstream event: {error:?}"))?;
+                            if association.event_type.as_deref() == Some("response.created") {
+                                native_candidate = match association.turn_ids.as_slice() {
+                                    [id] => turns.get(id).and_then(|turn| native_control::Candidate::new(&event, &turn.value, turn.route.soft_keys.clone())),
+                                    _ => None,
+                                };
+                            }
+                            if let Some(candidate) = native_candidate.as_mut() {
+                                candidate.observe(&event);
+                            }
                             if association.event_type.as_deref() == Some("response.created") {
                                 for turn_id in &association.turn_ids {
                                     if awaiting_response_created == Some(*turn_id) {
@@ -3501,6 +3587,7 @@ impl App {
                             }
                         }
                         Some(Err(error)) => {
+                            native_candidate = None;
                             let close_downstream = self
                                 .recover_or_settle_direct_end(
                                     &mut protocol,
@@ -3533,6 +3620,7 @@ impl App {
                             }
                         }
                         None => {
+                            native_candidate = None;
                             let close_downstream = self
                                 .recover_or_settle_direct_end(
                                     &mut protocol,
@@ -4055,6 +4143,9 @@ impl App {
         let mut hard_owner = false;
         if !forced_live {
             for (kind, key) in &affinity_keys {
+                if !kind.is_hard_continuity() {
+                    continue;
+                }
                 let Some(binding) = self.router.affinity.get(key).await else {
                     continue;
                 };
@@ -4087,7 +4178,7 @@ impl App {
                 ));
             }
         }
-        let key = affinity_keys.first().map(|(_, key)| key.clone());
+        let key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
         let mut selection = if let Some(call_id) = &live_call_id {
             let Some(account) = self.live_calls.account(call_id).await else {
                 return Ok(error_response(
@@ -4122,16 +4213,7 @@ impl App {
                 .context("no eligible account for fresh direct WebSocket")?
         } else {
             self.router
-                .select(
-                    &listener.pool,
-                    pool,
-                    if frame_aware_direct {
-                        None
-                    } else {
-                        key.clone()
-                    },
-                    None,
-                )
+                .select(&listener.pool, pool, key.clone(), None)
                 .await
                 .context("no eligible account")?
         };
@@ -4243,8 +4325,10 @@ impl App {
                         "upstream selected a websocket subprotocol not offered by the client",
                     ));
                 }
-                for (_, alias) in &affinity_keys {
-                    self.router.bind(alias.clone(), &selection.account_id).await;
+                for (kind, alias) in &affinity_keys {
+                    if let Some(alias) = affinity_bind_key(*kind, alias, hard_owner) {
+                        self.router.bind(alias, &selection.account_id).await;
+                    }
                 }
                 if let Some(turn_state) = response
                     .headers()
@@ -4332,8 +4416,8 @@ impl App {
                 return Ok(map_upgrade_response(response));
             }
             self.router.end(&selection.account_id).await;
-            let (response, body_failure) = inspect_rejection_body(response).await?;
-            let capacity = body_failure == Some(FailureKind::Capacity);
+            let (response, inspection) = inspect_rejection_body(response).await?;
+            let capacity = inspection.failure == Some(FailureKind::Capacity);
             if capacity {
                 self.router.capacity_failure(&selection.account_id).await;
             }
@@ -4380,9 +4464,10 @@ impl App {
                 self.reject_account_bearer(&selection.account_id, &credentials)
                     .await;
             }
-            let retry = is_quota_status(response.status())
-                || is_selected_gateway_failure(response.status());
-            if capacity {
+            let retry = inspection.permits_account_failure()
+                && (is_quota_status(response.status())
+                    || is_selected_gateway_failure(response.status()));
+            if capacity || !inspection.permits_account_failure() {
                 // The body classification takes precedence over quota/gateway status.
             } else if matches!(
                 response.status(),
@@ -4412,8 +4497,10 @@ impl App {
                     return Ok(response);
                 }
                 selection = alternate.context("no alternate account")?;
-                for (_, alias) in &affinity_keys {
-                    self.router.bind(alias.clone(), &selection.account_id).await;
+                for (kind, alias) in &affinity_keys {
+                    if let Some(alias) = affinity_bind_key(*kind, alias, hard_owner) {
+                        self.router.bind(alias, &selection.account_id).await;
+                    }
                 }
                 continue;
             }
@@ -4817,18 +4904,52 @@ fn is_shared_network_io_error(error: &std::io::Error) -> bool {
     })
 }
 
+struct RejectionInspection {
+    failure: Option<FailureKind>,
+    complete: bool,
+}
+
+impl RejectionInspection {
+    fn permits_account_failure(&self) -> bool {
+        // A truncated inspection cannot rule out a scoped refusal later in
+        // the body. Forward it without guessing at account health or replay.
+        self.complete && self.failure != Some(FailureKind::ScopedQuota)
+    }
+}
+
 /// Inspect a bounded rejection prefix before interpreting its HTTP status. Replay every
 /// frame unchanged, including trailers and any read error, to the downstream body.
 async fn inspect_rejection_body(
     response: Response<Incoming>,
-) -> Result<(Response<ProxyBody>, Option<FailureKind>)> {
+) -> Result<(Response<ProxyBody>, RejectionInspection)> {
     if response.status().is_success()
         || matches!(
             response.status(),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         )
     {
-        return Ok((map_http_response(response), None));
+        return Ok((
+            map_http_response(response),
+            RejectionInspection {
+                failure: None,
+                complete: true,
+            },
+        ));
+    }
+    if response
+        .headers()
+        .get("content-encoding")
+        .is_some_and(|encoding| encoding != "identity")
+    {
+        // Decoding arbitrary upstream encodings is outside the inspection
+        // budget. Preserve the wire body, but do not guess at its quota scope.
+        return Ok((
+            map_http_response(response),
+            RejectionInspection {
+                failure: None,
+                complete: false,
+            },
+        ));
     }
     let (mut parts, mut body) = response.into_parts();
     let mut frames = std::collections::VecDeque::new();
@@ -4885,7 +5006,7 @@ async fn inspect_rejection_body(
             }
             .boxed(),
         ),
-        failure,
+        RejectionInspection { failure, complete },
     ))
 }
 
@@ -5086,7 +5207,7 @@ impl HttpResponseObserver {
             let classification = classify_terminal_event(&event.value);
             if matches!(
                 classification.kind,
-                FailureKind::Quota | FailureKind::Capacity
+                FailureKind::Quota | FailureKind::ScopedQuota | FailureKind::Capacity
             ) {
                 self.failure = Some(classification);
                 self.terminal = event.terminal.or(self.terminal);
@@ -5136,7 +5257,7 @@ impl HttpResponseObserver {
                         });
                     if matches!(
                         classification.kind,
-                        FailureKind::Quota | FailureKind::Capacity
+                        FailureKind::Quota | FailureKind::ScopedQuota | FailureKind::Capacity
                     ) {
                         self.failure = Some(classification);
                         self.deferred_ids.clear();
@@ -5173,7 +5294,7 @@ impl HttpResponseObserver {
                     });
                 if matches!(
                     classification.kind,
-                    FailureKind::Quota | FailureKind::Capacity
+                    FailureKind::Quota | FailureKind::ScopedQuota | FailureKind::Capacity
                 ) {
                     self.failure = Some(classification);
                 } else {
@@ -5329,7 +5450,7 @@ impl LeasedIncoming {
                     if !capacity_observation.0.swap(true, Ordering::AcqRel) {
                         router.capacity_failure(&account).await;
                     }
-                } else {
+                } else if quota.kind == FailureKind::Quota {
                     router
                         .quota_failure_for_owner(&account, &headers, &quota_owner)
                         .await;
@@ -6369,6 +6490,7 @@ async fn collect_proxy_body_with_initial(
 mod tests {
     include!("capacity_tests.rs");
     include!("quota_identity_tests.rs");
+    include!("scoped_quota_tests.rs");
     include!("usage_activation_tests.rs");
     use super::*;
     use crate::{
@@ -8042,6 +8164,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_cache_cohort_places_siblings_before_thread_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, listener, router, stats) = direct_test_app(dir.path());
+        assert!(
+            router
+                .bind(router.affinity.key("prompt-cache:tree"), "a")
+                .await
+        );
+        assert!(router.bind(router.affinity.key("session:tree"), "b").await);
+        for child in ["child-one", "child-two"] {
+            assert!(
+                router
+                    .bind(router.affinity.key(&format!("thread:{child}")), "b")
+                    .await
+            );
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert("session-id", "tree".parse().unwrap());
+            headers.insert("thread-id", child.parse().unwrap());
+            let replay = ReplayBody::from_bytes(
+                Bytes::from_static(br#"{"input":[],"prompt_cache_key":"tree"}"#),
+                app.config.proxy.max_request_bytes,
+                app.config.proxy.max_spool_bytes,
+                stats.clone(),
+            )
+            .unwrap();
+            let route = app
+                .route_websocket_frame(&listener, &headers, &replay, Some("b"))
+                .await
+                .unwrap();
+            assert_eq!(route.account_id, "a");
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_session_cohort_and_parent_place_fresh_children_without_rebinding_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, listener, router, stats) = direct_test_app(dir.path());
+        let parent = router.affinity.key("thread:parent");
+        assert!(router.bind(parent.clone(), "a").await);
+        let replay = ReplayBody::from_bytes(
+            Bytes::from_static(br#"{"input":[]}"#),
+            app.config.proxy.max_request_bytes,
+            app.config.proxy.max_spool_bytes,
+            stats,
+        )
+        .unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-codex-parent-thread-id", "parent".parse().unwrap());
+        headers.insert("thread-id", "first-child".parse().unwrap());
+        headers.insert("session-id", "tree".parse().unwrap());
+        let first = app
+            .route_websocket_frame(&listener, &headers, &replay, Some("b"))
+            .await
+            .unwrap();
+        assert_eq!(first.account_id, "a");
+        for key in first.soft_keys {
+            assert_ne!(key, parent);
+            assert!(router.bind(key, "a").await);
+        }
+        assert!(router.bind(parent.clone(), "b").await);
+        headers.insert("thread-id", "second-child".parse().unwrap());
+        let second = app
+            .route_websocket_frame(&listener, &headers, &replay, Some("b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.account_id, "a",
+            "session cohort wins over moved parent"
+        );
+        for key in second.soft_keys {
+            assert!(router.bind(key, "a").await);
+        }
+        assert_eq!(router.affinity.get(&parent).await.unwrap().account_id, "b");
+        headers.remove("session-id");
+        let existing = app
+            .route_websocket_frame(&listener, &headers, &replay, Some("b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            existing.account_id, "a",
+            "without a cohort an existing child keeps its own affinity"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_hard_owner_does_not_move_shared_cohort_or_parent() {
+        for owner_kind in ["previous-response", "turn-state", "file"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (app, listener, router, stats) = direct_test_app(dir.path());
+            let cache = router.affinity.key("prompt-cache:tree");
+            let session = router.affinity.key("session:tree");
+            let parent = router.affinity.key("thread:parent");
+            for key in [&cache, &session, &parent] {
+                assert!(router.bind(key.clone(), "a").await);
+            }
+            let owner = router.affinity.key(&format!("{owner_kind}:owned"));
+            if owner_kind == "file" {
+                assert!(app.file_owners.put(owner, "b".into(), 0).await);
+            } else {
+                assert!(router.bind(owner, "b").await);
+            }
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert("session-id", "tree".parse().unwrap());
+            headers.insert("thread-id", "child".parse().unwrap());
+            headers.insert("x-codex-parent-thread-id", "parent".parse().unwrap());
+            let mut body = serde_json::json!({"input":[], "prompt_cache_key":"tree"});
+            match owner_kind {
+                "previous-response" => body["previous_response_id"] = "owned".into(),
+                "turn-state" => {
+                    headers.insert("x-codex-turn-state", "owned".parse().unwrap());
+                }
+                "file" => {
+                    body["input"] = serde_json::json!([{"role":"user","content":[{"type":"input_file","file_id":"owned"}]}])
+                }
+                _ => unreachable!(),
+            }
+            let replay = ReplayBody::from_bytes(
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                app.config.proxy.max_request_bytes,
+                app.config.proxy.max_spool_bytes,
+                stats,
+            )
+            .unwrap();
+            let route = app
+                .route_websocket_frame(&listener, &headers, &replay, None)
+                .await
+                .unwrap();
+            assert_eq!(route.account_id, "b", "{owner_kind}");
+            assert!(route.hard_owner);
+            for key in route.soft_keys {
+                assert!(router.bind(key, "b").await);
+            }
+            for key in [&cache, &session, &parent] {
+                assert_eq!(
+                    router.affinity.get(key).await.unwrap().account_id,
+                    "a",
+                    "{owner_kind}"
+                );
+            }
+            assert_eq!(
+                router
+                    .affinity
+                    .get(&router.affinity.key("thread:child"))
+                    .await
+                    .unwrap()
+                    .account_id,
+                "b"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_exhausted_parent_placement_never_rebinds_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, listener, router, stats) = direct_test_app(dir.path());
+        let parent = router.affinity.key("thread:parent");
+        assert!(router.bind(parent.clone(), "a").await);
+        let mut usage = hyper::HeaderMap::new();
+        usage.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        router.observe_headers("a", &usage).await;
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-codex-parent-thread-id", "parent".parse().unwrap());
+        headers.insert("thread-id", "fresh-child".parse().unwrap());
+        let replay = ReplayBody::from_bytes(
+            Bytes::from_static(br#"{"input":[]}"#),
+            app.config.proxy.max_request_bytes,
+            app.config.proxy.max_spool_bytes,
+            stats,
+        )
+        .unwrap();
+        let route = app
+            .route_websocket_frame(&listener, &headers, &replay, None)
+            .await
+            .unwrap();
+        assert_eq!(route.account_id, "b");
+        assert_eq!(
+            router.affinity.get(&parent).await.unwrap().account_id,
+            "a",
+            "selection must not prebind parent"
+        );
+        for key in route.soft_keys {
+            assert!(router.bind(key, "b").await);
+        }
+        assert_eq!(
+            router.affinity.get(&parent).await.unwrap().account_id,
+            "a",
+            "success must not rebind parent"
+        );
+        assert_eq!(
+            router
+                .affinity
+                .get(&router.affinity.key("thread:fresh-child"))
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
+    }
+
+    #[tokio::test]
     async fn direct_fresh_frame_rotates_off_exhausted_socket_account() {
         let dir = tempfile::tempdir().unwrap();
         let (app, listener, router, stats) = direct_test_app(dir.path());
@@ -8078,6 +8400,18 @@ mod tests {
 
         assert_eq!(route.account_id, "b");
         assert!(!route.hard_owner);
+        for key in route.soft_keys {
+            assert!(router.bind(key, "b").await);
+        }
+        assert_eq!(
+            router
+                .affinity
+                .get(&router.affinity.key("session:transport"))
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
     }
 
     fn managed_direct_test_app(
@@ -9366,7 +9700,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         upstream_task.abort();
     }
 
-    async fn start_caller_proxy(
+    pub(super) async fn start_caller_proxy(
         dir: &std::path::Path,
         upstream: String,
         mode: ResponsesWebsocketMode,
@@ -9425,9 +9759,21 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         (proxy_addr, task, router)
     }
 
-    async fn start_two_account_proxy(
+    pub(super) async fn start_two_account_proxy(
         dir: &std::path::Path,
         upstream: String,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<Router>,
+    ) {
+        start_two_account_proxy_with_mode(dir, upstream, ResponsesWebsocketMode::HttpBridge).await
+    }
+
+    async fn start_two_account_proxy_with_mode(
+        dir: &std::path::Path,
+        upstream: String,
+        mode: ResponsesWebsocketMode,
     ) -> (
         std::net::SocketAddr,
         tokio::task::JoinHandle<Result<()>>,
@@ -9457,7 +9803,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         let config = Arc::new(Config {
             proxy: ProxyConfig {
                 upstream,
-                responses_websocket_mode: ResponsesWebsocketMode::HttpBridge,
+                responses_websocket_mode: mode,
                 installation_secret: "0123456789abcdef".into(),
                 affinity_key: "0123456789abcdef0123456789abcdef".into(),
                 state_dir: Some(dir.join("state")),
@@ -9568,7 +9914,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         websocket
     }
 
-    async fn connect_test_websocket(address: std::net::SocketAddr) -> WebSocketStream<TcpStream> {
+    pub(super) async fn connect_test_websocket(
+        address: std::net::SocketAddr,
+    ) -> WebSocketStream<TcpStream> {
         connect_test_websocket_with_token(address, "caller-token").await
     }
 

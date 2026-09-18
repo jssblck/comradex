@@ -193,9 +193,9 @@ async fn assert_owner(fixture: &ContinuityFixture) {
 }
 
 async fn assert_no_success_affinity(fixture: &ContinuityFixture) {
-    // Router selection already binds the primary thread key before dispatch.
-    // Secondary session aliases and returned response IDs remain success-gated.
-    for identity in ["session:first-session", "previous-response:resp_first"] {
+    // Router selection already binds the primary session cohort before dispatch.
+    // Secondary thread aliases and returned response IDs remain success-gated.
+    for identity in ["thread:first-thread", "previous-response:resp_first"] {
         let key = fixture.app.router.affinity.key(identity);
         assert!(
             fixture.app.router.affinity.get(&key).await.is_none(),

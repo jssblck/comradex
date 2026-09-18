@@ -614,25 +614,19 @@ async fn send_native_reasoning_request(
     }
 }
 
-async fn exercise_native_reasoning_quota_replay(mode: ResponsesWebsocketMode, websocket: bool) {
+async fn exercise_native_reasoning_quota_refusal(mode: ResponsesWebsocketMode, websocket: bool) {
     let upstream = start_context_upstream().await;
     let dir = tempfile::tempdir().unwrap();
     let proxy = start_context_proxy(dir.path(), upstream.address, mode).await;
     let body = native_reasoning_continuation();
-    assert!(send_native_reasoning_request(&proxy, body.clone(), websocket).await);
+    assert!(!send_native_reasoning_request(&proxy, body.clone(), websocket).await);
     let seen = upstream.seen.lock().unwrap();
-    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.len(), 1);
     assert_eq!(
         seen[0].authorization,
         format!("Bearer {}", test_token("workspace-a", "user-a"))
     );
-    assert_eq!(
-        seen[1].authorization,
-        format!("Bearer {}", test_token("workspace-b", "user-b"))
-    );
     assert_eq!(seen[0].body["input"], body["input"]);
-    assert_eq!(seen[1].body["input"], body["input"]);
-    assert_eq!(seen[0].body, seen[1].body);
 }
 
 async fn exercise_native_reasoning_ownership_negatives(
@@ -648,8 +642,14 @@ async fn exercise_native_reasoning_ownership_negatives(
         json!({"type":"input_file","file_id":"file_owned"}),
         json!({"type":"reasoning","id":"rs_missing_ciphertext"}),
         json!({"type":"reasoning","encrypted_content":"native","nested":{"encrypted_content":"owned"}}),
+        json!({"type":"message","id":"msg_owned","role":"assistant","content":[]}),
+        json!({"type":"function_call","id":"fc_owned","name":"f","call_id":"call_owned","arguments":"{}"}),
     ] {
         let mut body = native_reasoning_continuation();
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item["type"] != "reasoning");
         body["input"].as_array_mut().unwrap().push(extra);
         cases.push(body);
     }
@@ -663,6 +663,10 @@ async fn exercise_native_reasoning_ownership_negatives(
         ),
     ] {
         let mut body = native_reasoning_continuation();
+        body["input"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item["type"] != "reasoning");
         body[key] = value;
         cases.push(body);
     }
@@ -695,19 +699,19 @@ async fn exercise_native_reasoning_ownership_negatives(
 }
 
 #[tokio::test]
-async fn http_native_reasoning_quota_replay_preserves_items_and_ownership() {
-    exercise_native_reasoning_quota_replay(ResponsesWebsocketMode::HttpBridge, false).await;
+async fn http_native_reasoning_quota_refusal_preserves_items_and_ownership() {
+    exercise_native_reasoning_quota_refusal(ResponsesWebsocketMode::HttpBridge, false).await;
     exercise_native_reasoning_ownership_negatives(ResponsesWebsocketMode::HttpBridge, false).await;
 }
 
 #[tokio::test]
-async fn http_bridge_native_reasoning_quota_replay_preserves_items_and_ownership() {
-    exercise_native_reasoning_quota_replay(ResponsesWebsocketMode::HttpBridge, true).await;
+async fn http_bridge_native_reasoning_quota_refusal_preserves_items_and_ownership() {
+    exercise_native_reasoning_quota_refusal(ResponsesWebsocketMode::HttpBridge, true).await;
     exercise_native_reasoning_ownership_negatives(ResponsesWebsocketMode::HttpBridge, true).await;
 }
 
 #[tokio::test]
-async fn direct_websocket_native_reasoning_quota_replay_preserves_items_and_ownership() {
-    exercise_native_reasoning_quota_replay(ResponsesWebsocketMode::Direct, true).await;
+async fn direct_websocket_native_reasoning_quota_refusal_preserves_items_and_ownership() {
+    exercise_native_reasoning_quota_refusal(ResponsesWebsocketMode::Direct, true).await;
     exercise_native_reasoning_ownership_negatives(ResponsesWebsocketMode::Direct, true).await;
 }

@@ -15,8 +15,49 @@ use tracing::error;
 const DATABASE_VERSION: i64 = 1;
 const MAX_TOUCH_PERSIST_INTERVAL_SECONDS: u64 = 15 * 60;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ThreadKey(pub String);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum BindingPolicy {
+    #[default]
+    Replace,
+    PreserveExisting,
+    LookupOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ThreadKey {
+    hash: String,
+    #[serde(skip)]
+    binding_policy: BindingPolicy,
+}
+
+impl PartialEq for ThreadKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+    }
+}
+
+impl Eq for ThreadKey {}
+
+impl std::hash::Hash for ThreadKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.hash, state);
+    }
+}
+
+impl ThreadKey {
+    /// Carry the write policy through deferred response binding. Hard-owned
+    /// child turns may establish a cohort, but cannot move its existing owner.
+    pub fn preserve_existing(mut self) -> Self {
+        self.binding_policy = BindingPolicy::PreserveExisting;
+        self
+    }
+
+    pub fn lookup_only(mut self) -> Self {
+        self.binding_policy = BindingPolicy::LookupOnly;
+        self
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Binding {
@@ -121,15 +162,16 @@ impl AffinityStore {
     }
 
     pub fn key(&self, raw: &str) -> ThreadKey {
-        ThreadKey(
-            blake3::keyed_hash(&self.key, raw.as_bytes())
+        ThreadKey {
+            hash: blake3::keyed_hash(&self.key, raw.as_bytes())
                 .to_hex()
                 .to_string(),
-        )
+            binding_policy: BindingPolicy::Replace,
+        }
     }
 
     pub async fn get(&self, key: &ThreadKey) -> Option<Binding> {
-        let key = key.0.clone();
+        let key = key.hash.clone();
         let now = now();
         let idle_seconds = self.idle.as_secs();
         let touch_interval = idle_seconds
@@ -184,17 +226,21 @@ impl AffinityStore {
     }
 
     pub async fn put(&self, key: ThreadKey, account_id: String, generation: u64) -> bool {
+        if key.binding_policy == BindingPolicy::LookupOnly {
+            return true;
+        }
         let now = now();
         match self
             .database
             .call(move |connection| {
                 connection.execute(
-                    "insert into bindings (key, account_id, last_seen, account_generation) values (?1, ?2, ?3, ?4) on conflict(key) do update set account_id = excluded.account_id, last_seen = excluded.last_seen, account_generation = excluded.account_generation",
+                    "insert into bindings (key, account_id, last_seen, account_generation) values (?1, ?2, ?3, ?4) on conflict(key) do update set account_id = excluded.account_id, last_seen = excluded.last_seen, account_generation = excluded.account_generation where not ?5 or bindings.account_id = excluded.account_id",
                     params![
-                        key.0,
+                        key.hash,
                         account_id,
                         to_sql_u64(now, "binding last_seen")?,
-                        to_sql_u64(generation, "binding account_generation")?
+                        to_sql_u64(generation, "binding account_generation")?,
+                        key.binding_policy == BindingPolicy::PreserveExisting,
                     ],
                 )?;
                 Ok(())
@@ -235,7 +281,7 @@ impl AffinityStore {
     }
 
     pub async fn remove(&self, key: &ThreadKey) -> bool {
-        let key = key.0.clone();
+        let key = key.hash.clone();
         match self
             .database
             .call(move |connection| {
@@ -604,7 +650,10 @@ mod tests {
         assert_eq!(store.account_epoch("a").await, 3);
         assert_eq!(
             store
-                .get(&ThreadKey("hashed-one".into()))
+                .get(&ThreadKey {
+                    hash: "hashed-one".into(),
+                    binding_policy: BindingPolicy::Replace
+                })
                 .await
                 .unwrap()
                 .account_id,
@@ -612,7 +661,14 @@ mod tests {
         );
         assert!(
             store
-                .put(ThreadKey("hashed-three".into()), "c".into(), 0)
+                .put(
+                    ThreadKey {
+                        hash: "hashed-three".into(),
+                        binding_policy: BindingPolicy::Replace
+                    },
+                    "c".into(),
+                    0
+                )
                 .await
         );
         assert_eq!(fs::read(legacy_path).unwrap(), legacy_bytes);
@@ -689,10 +745,21 @@ mod tests {
 
         let store = AffinityStore::load(legacy_path, KEY, Duration::from_secs(60)).unwrap();
         assert_eq!(store.len_and_bytes().await.0, 1);
-        assert!(store.get(&ThreadKey("partial".into())).await.is_none());
+        assert!(
+            store
+                .get(&ThreadKey {
+                    hash: "partial".into(),
+                    binding_policy: BindingPolicy::Replace
+                })
+                .await
+                .is_none()
+        );
         assert_eq!(
             store
-                .get(&ThreadKey("expected".into()))
+                .get(&ThreadKey {
+                    hash: "expected".into(),
+                    binding_policy: BindingPolicy::Replace
+                })
                 .await
                 .unwrap()
                 .account_id,
@@ -772,7 +839,10 @@ mod tests {
         store
             .database
             .call(move |connection| {
-                connection.execute("update bindings set last_seen = 0 where key = ?1", [key.0])?;
+                connection.execute(
+                    "update bindings set last_seen = 0 where key = ?1",
+                    [key.hash],
+                )?;
                 Ok(())
             })
             .await

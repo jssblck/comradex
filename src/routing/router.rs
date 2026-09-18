@@ -417,6 +417,9 @@ impl Router {
                         && !a.auth_unavailable()
                         && !a.login_in_progress
                         && a.quota_until.is_none_or(|v| v <= now)
+                        // Keep warm cohorts past the soft switch threshold, but
+                        // let fully consumed usage fall through to a fresh pick.
+                        && a.usage.is_none_or(|usage| usage < 100)
                 });
             if eligible {
                 let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -1698,6 +1701,58 @@ mod tests {
 
         let selected = router.select_preferred("default", pool, "a").await.unwrap();
         assert_eq!(selected.account_id, "b");
+    }
+
+    #[tokio::test]
+    async fn soft_cohort_stays_warm_past_switch_threshold_but_moves_at_full_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.proxy.switch_at = 80;
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity.clone());
+        let pool = &cfg.pools["default"];
+        let cohort = affinity.key("prompt-cache:tree");
+        assert!(router.bind(cohort.clone(), "a").await);
+        let mut usage = HeaderMap::new();
+        usage.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("95"),
+        );
+        router.observe_headers("a", &usage).await;
+        assert_eq!(
+            router
+                .select("default", pool, Some(cohort.clone()), None)
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
+        usage.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("100"),
+        );
+        router.observe_headers("a", &usage).await;
+        assert_eq!(
+            router
+                .select("default", pool, Some(cohort.clone()), None)
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
+        assert_eq!(affinity.get(&cohort).await.unwrap().account_id, "b");
+        // Usage alone does not invalidate mandatory continuity on its issuer.
+        assert_eq!(
+            router.select_exact(pool, "a").await.unwrap().account_id,
+            "a"
+        );
     }
 
     #[tokio::test]
