@@ -121,11 +121,25 @@ struct UsageWindowSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+enum AccountRole: String, CaseIterable, Sendable {
+    case preferred, normal, preserved
+
+    var title: String {
+        switch self {
+        case .preferred: return "Preferred — use first"
+        case .normal: return "Normal — automatic selection"
+        case .preserved: return "Preserved — use last"
+        }
+    }
+}
+
 struct PoolSnapshot: Codable, Equatable, Identifiable, Sendable {
     let name: String
     let members: [String]
     let preferred: String?
     let active: String?
+    var preserved: String? = nil
+    var wired: String? = nil
 
     var id: String { name }
 }

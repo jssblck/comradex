@@ -1,13 +1,15 @@
 import AppKit
 import SwiftUI
 
-private final class PreferredAccountAction: NSObject {
+private final class AccountRoleAction: NSObject {
     let pool: String
     let account: String
+    let role: AccountRole
 
-    init(pool: String, account: String) {
+    init(pool: String, account: String, role: AccountRole) {
         self.pool = pool
         self.account = account
+        self.role = role
     }
 }
 
@@ -163,35 +165,51 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private func addAccount(_ account: AccountSnapshot, pool: PoolSnapshot?) {
         let isPreferred = pool?.preferred == account.name
-        let isLastUsed = pool?.active == account.name
+        let isPreserved = pool?.preserved == account.name
+        let isLastUsed = pool?.wired == account.name
         let hasRunningLogin = store.isLoginRunning && store.login?.account == account.name
         let loginAction = account.needsLoginAction || account.isLoginInProgress || hasRunningLogin
+        let detail = hasRunningLogin ? "Login in progress…" : accountDetail(account)
+        let roleLabel = isPreferred ? "Preferred" : isPreserved ? "Preserved" : nil
         let item = NSMenuItem(
-            title: account.name,
-            action: loginAction ? #selector(reloginSelected(_:)) : pool == nil ? nil : #selector(preferredAccountSelected(_:)),
+            title: [account.name, detail.isEmpty ? nil : detail, roleLabel].compactMap { $0 }.joined(separator: " · "),
+            action: nil,
             keyEquivalent: ""
         )
-        item.target = self
-        let detail = hasRunningLogin ? "Login in progress…" : accountDetail(account)
-        if isLastUsed && !isPreferred {
-            item.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Last used · \(detail)")
-        }
-        item.toolTip = [isPreferred ? "Preferred" : nil, accountDetail(account, expanded: true), loginAction ? "Click to sign in; keeps your preferred account unchanged" : nil]
+        item.state = isLastUsed ? .on : .off
+        item.toolTip = [isLastUsed ? "Last used for an upstream request" : nil, roleLabel, accountDetail(account, expanded: true)]
             .compactMap { $0 }.joined(separator: " · ")
-        if !detail.isEmpty {
-            item.title = "\(account.name) · \(detail)"
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        if let pool {
+            submenu.addItem(.sectionHeader(title: "Routing in \(pool.name)"))
+            let current: AccountRole = isPreferred ? .preferred : isPreserved ? .preserved : .normal
+            for role in AccountRole.allCases {
+                let choice = actionItem(
+                    title: role.title,
+                    action: #selector(accountRoleSelected(_:)),
+                    enabled: store.updatingPool == nil && store.connectingAccount == nil
+                )
+                choice.state = role == current ? .on : .off
+                choice.representedObject = AccountRoleAction(pool: pool.name, account: account.name, role: role)
+                choice.toolTip = "Applies to new work. Existing conversations keep their account."
+                submenu.addItem(choice)
+            }
         }
-        item.state = isPreferred ? .on : .off
-        item.isEnabled = store.updatingPool == nil && store.connectingAccount == nil
-            && (loginAction ? (hasRunningLogin || (!store.isLoginRunning && !account.isLoginInProgress)) : pool != nil)
         if loginAction {
-            item.representedObject = account.name
-        } else if let pool {
-            item.representedObject = PreferredAccountAction(pool: pool.name, account: account.name)
+            if !submenu.items.isEmpty { submenu.addItem(.separator()) }
+            let login = actionItem(
+                title: hasRunningLogin ? "Continue Sign In…" : "Sign In…",
+                action: #selector(reloginSelected(_:)),
+                enabled: store.updatingPool == nil && store.connectingAccount == nil
+                    && (hasRunningLogin || (!store.isLoginRunning && !account.isLoginInProgress))
+            )
+            login.representedObject = account.name
+            login.toolTip = "Sign in without changing this account's routing role."
+            submenu.addItem(login)
         }
-        menu.addItem(item)
-
         if account.isInbound {
+            if !submenu.items.isEmpty { submenu.addItem(.separator()) }
             let connect = actionItem(
                 title: store.connectingAccount == account.name ? "Connecting Codex login…" : "Connect existing Codex login…",
                 icon: "person.crop.circle.badge.checkmark",
@@ -199,10 +217,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 enabled: store.connectingAccount == nil && !store.isLoginRunning && store.updatingPool == nil
             )
             connect.representedObject = account.name
-            connect.indentationLevel = 1
             connect.toolTip = "Reuse your local Codex login and show its usage."
-            menu.addItem(connect)
+            submenu.addItem(connect)
         }
+        if !submenu.items.isEmpty { item.submenu = submenu }
+        menu.addItem(item)
     }
 
     private func addInformationalItem(_ title: String, icon: String) {
@@ -249,11 +268,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         NSApplication.shared.terminate(nil)
     }
 
-    @objc private func preferredAccountSelected(_ sender: NSMenuItem) {
-        guard let selection = sender.representedObject as? PreferredAccountAction else { return }
+    @objc private func accountRoleSelected(_ sender: NSMenuItem) {
+        guard let selection = sender.representedObject as? AccountRoleAction else { return }
         Task { [weak self] in
             guard let self else { return }
-            await store.setPreferred(pool: selection.pool, account: selection.account)
+            await store.setAccountRole(pool: selection.pool, account: selection.account, role: selection.role)
             rebuildMenu()
         }
     }

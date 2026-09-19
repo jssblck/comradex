@@ -69,6 +69,20 @@ final class ComradexStore: ObservableObject {
         }
     }
 
+    func setAccountRole(pool: String, account: String, role: AccountRole) async {
+        guard updatingPool == nil, connectingAccount == nil else { return }
+        updatingPool = pool
+        statusGeneration &+= 1
+        defer { updatingPool = nil }
+        do {
+            let updated = try await client.setAccountRole(pool: pool, account: account, role: role)
+            apply(status: updated)
+            actionErrorMessage = nil
+        } catch {
+            actionErrorMessage = error.localizedDescription
+        }
+    }
+
     func beginLogin(account: String) {
         guard !isLoginRunning else { return }
         loginTask?.cancel()

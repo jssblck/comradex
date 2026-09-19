@@ -433,7 +433,7 @@ impl Router {
                 });
             }
         }
-        let configured_preferred = self.preferred.lock().await.get(pool_name).cloned();
+        let (configured_preferred, preserved) = self.account_order(pool_name).await;
         let active_id = self.active.lock().await.get(pool_name).cloned();
         let eligible = |id: &str| {
             exclude != Some(id)
@@ -444,7 +444,6 @@ impl Router {
                         && a.avoid_until.is_none_or(|v| v <= now)
                 })
         };
-        let preserved = self.preserved.lock().await.get(pool_name).cloned();
         let has_unpreserved = pool
             .members
             .iter()
@@ -563,6 +562,26 @@ impl Router {
         }
     }
 
+    /// Publish both validated roles together; readers observe one consistent pair.
+    pub async fn set_account_order(&self, pool: &str, first: Option<String>, last: Option<String>) {
+        let mut preferred = self.preferred.lock().await;
+        let mut preserved = self.preserved.lock().await;
+        preferred.remove(pool);
+        preserved.remove(pool);
+        if let Some(account) = first {
+            preferred.insert(pool.to_owned(), account);
+        }
+        if let Some(account) = last {
+            preserved.insert(pool.to_owned(), account);
+        }
+    }
+
+    async fn account_order(&self, pool: &str) -> (Option<String>, Option<String>) {
+        let preferred = self.preferred.lock().await;
+        let preserved = self.preserved.lock().await;
+        (preferred.get(pool).cloned(), preserved.get(pool).cloned())
+    }
+
     pub async fn routing_snapshot(&self) -> RoutingSnapshot {
         let now = Instant::now();
         let wall_now = Utc::now();
@@ -575,21 +594,21 @@ impl Router {
             .map(|(name, runtime)| (name.clone(), account_routing_status(runtime, now, wall_now)))
             .collect();
         drop(accounts);
+        let preferred = self.preferred.lock().await;
+        let preserved = self.preserved.lock().await;
+        let preferred_accounts = preferred
+            .iter()
+            .map(|(pool, account)| (pool.clone(), account.clone()))
+            .collect();
+        let preserved_accounts = preserved
+            .iter()
+            .map(|(pool, account)| (pool.clone(), account.clone()))
+            .collect();
+        drop(preserved);
+        drop(preferred);
         RoutingSnapshot {
-            preferred_accounts: self
-                .preferred
-                .lock()
-                .await
-                .iter()
-                .map(|(pool, account)| (pool.clone(), account.clone()))
-                .collect(),
-            preserved_accounts: self
-                .preserved
-                .lock()
-                .await
-                .iter()
-                .map(|(pool, account)| (pool.clone(), account.clone()))
-                .collect(),
+            preferred_accounts,
+            preserved_accounts,
             active_accounts: self
                 .active
                 .lock()
@@ -726,7 +745,7 @@ impl Router {
         // Fresh work: a configured-preferred flip to another eligible account mid-resolve
         // supersedes this selection. Bound work ignores preference by design.
         if !selection.bound {
-            let preserved = self.preserved.lock().await.get(pool_name).cloned();
+            let (configured, preserved) = self.account_order(pool_name).await;
             if preserved.as_deref() == Some(selection.account_id.as_str()) {
                 let accounts = self.account_runtimes().await;
                 let has_alternative = pool.members.iter().any(|id| {
@@ -743,7 +762,6 @@ impl Router {
                     return Err(SelectionStaleReason::PreservedSuperseded);
                 }
             }
-            let configured = self.preferred.lock().await.get(pool_name).cloned();
             if let Some(preferred_id) = configured
                 && preferred_id != selection.account_id
                 && selection.excluded_account.as_deref() != Some(preferred_id.as_str())

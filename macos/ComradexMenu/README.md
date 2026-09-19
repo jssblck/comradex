@@ -1,14 +1,14 @@
 # Comradex Menu
 
-A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; choosing a pool's preferred account; and completing account login when authentication is required.
+A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; choosing each account's routing role; and completing account login when authentication is required.
 
-Each account occupies one line. Healthy managed accounts show the main quota and its reset countdown, such as `sq · 68% left · 6d 4h`; the tooltip labels the countdown explicitly. The primary window is preferred; zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window’s reset countdown (falling back to the retry deadline); the tooltip explains the rate limit. Other authentication or availability errors replace stale usage details. Account rows have no type or health icons: the native check exclusively marks the preferred account, while the menu header's check continues to indicate daemon health.
+Each account occupies one line with its usage and reset countdown, including connected `app` accounts: `app · 17% left · 12h 15m · Preferred`. The primary quota window is shown; zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window's reset countdown (falling back to the retry deadline). Other authentication or availability errors replace stale usage details. Tooltips explicitly label reset countdowns.
 
-Click an account that needs sign-in or renewal to open its device login without changing your preferred account. There is no separate re-login row. While this app is handling login, the same row reopens the login window. The window distinguishes requesting a code from waiting for authorization, shows the selectable code, and provides Copy Code and browser controls. Starting another login attempt clears the previous attempt's code.
+The native check marks the account most recently used for an upstream request (`wired`), including bound conversations. It does not indicate routing preference or imply that only one account has work in flight. There is no dot indicator; before any upstream request, no account is checked. Preferred and Preserved appear as text labels. A single pool has no section header; multiple pools retain name-only section headers.
 
-The special `app` row explains `Codex App account` in its tooltip because it uses credentials supplied by the Codex desktop app rather than a separately managed account home.
+Each account opens a submenu with Preferred — use first, Normal — automatic selection, and Preserved — use last. The submenu checks the configured role. Each pool supports one preferred and one preserved account. Choosing a role replaces that role's previous holder; switching roles clears the selected account's opposite role atomically. Normal clears only the selected account's role. Preservation keeps an account available as a fallback, and existing conversations keep their bindings. Changes persist and apply live without restarting. Failed changes retain the previous displayed state and show an account-change error.
 
-For a single pool, account rows appear without a pool section header. A filled dot marks the last-used account only when it differs from the preferred account; if they are the same, the preferred check is sufficient. Multiple pools retain name-only section headers so repeated account rows remain attributable to their pool.
+Sign In… appears within the submenu when authentication or renewal is needed; it does not change routing. During this app's login flow, Continue Sign In… reopens the same login window. The window distinguishes requesting a code from waiting for authorization, shows the selectable code, and provides Copy Code and browser controls. Starting another attempt clears the previous code. Inbound accounts offer Connect existing Codex login… in the submenu.
 
 The app talks directly to the daemon's newline-delimited JSON protocol at `~/.config/comradex/state/control.sock`. It does not invoke the Comradex CLI, read configuration files, expose subprocess output, or handle credentials. Device login polling uses the daemon-issued random session ID and displays only the verification URI, user code, coarse state, and safe error text. Set `COMRADEX_CONTROL_SOCKET` before launching to use another socket path.
 
@@ -32,7 +32,7 @@ Scripts/compile_and_run.sh
 
 The package script always emits an `LSUIElement` menu-bar app (`MENU_BAR_APP=1`) and uses ad-hoc signing unless `APP_IDENTITY` is set. Set `ARCHES="arm64 x86_64"` for a universal build.
 
-The running daemon must implement `ui_status`, `ui_set_preferred`, `ui_start_login`, and `ui_login_status` on its existing user-only control socket.
+The running daemon must implement `ui_status`, `ui_set_account_role`, `ui_start_login`, and `ui_login_status` on its existing user-only control socket.
 
 ## CLI coexistence
 
