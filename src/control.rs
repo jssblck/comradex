@@ -43,6 +43,14 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_CLIENTS: usize = 32;
 const MAX_LOGIN_OUTPUT_BYTES: usize = 8 * 1024;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccountRole {
+    Preferred,
+    Normal,
+    Preserved,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum Request {
@@ -60,6 +68,11 @@ enum Request {
         secret: String,
     },
     UiStatus,
+    UiSetAccountRole {
+        pool: String,
+        account: String,
+        role: AccountRole,
+    },
     UiSetPreferred {
         pool: String,
         account: Option<String>,
@@ -84,6 +97,7 @@ impl Request {
             | Self::SetPreserved { secret, .. }
             | Self::RoutingStatus { secret } => Some(secret),
             Self::UiStatus
+            | Self::UiSetAccountRole { .. }
             | Self::UiSetPreferred { .. }
             | Self::UiStartLogin { .. }
             | Self::UiConnectExistingLogin { .. }
@@ -154,6 +168,7 @@ pub struct UiPoolStatus {
     pub name: String,
     pub members: Vec<String>,
     pub preferred: Option<String>,
+    pub preserved: Option<String>,
     pub active: Option<String>,
     /// Last account actually wired to upstream for this pool. `active` is only the last fresh
     /// pick and never reflects bound/select_exact traffic; `wired` is recorded after
@@ -747,6 +762,23 @@ async fn process(
                 update_preserved(config_path, config, router, edit_lock, &pool, account).await?;
                 Response::routing(router.routing_snapshot().await)
             }
+            Request::UiSetAccountRole {
+                pool,
+                account,
+                role,
+            } => {
+                update_account_role(
+                    config_path,
+                    config,
+                    router,
+                    edit_lock,
+                    &pool,
+                    &account,
+                    role,
+                )
+                .await?;
+                Response::status(build_ui_status(config, router, stats, login_manager).await)
+            }
             Request::UiStatus => {
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
             }
@@ -842,6 +874,47 @@ async fn update_preferred(
     let updated = accounts::set_preferred_account(&text, pool, account.as_deref())?;
     config::write_validated(config_path, &updated)?;
     router.set_preferred(pool, account).await;
+    Ok(())
+}
+
+// Change one account's role against the latest saved settings, never a stale UI snapshot.
+async fn update_account_role(
+    config_path: &Path,
+    config: &Config,
+    router: &Router,
+    edit_lock: &Mutex<()>,
+    pool: &str,
+    account: &str,
+    role: AccountRole,
+) -> Result<()> {
+    let pool_config = config.pools.get(pool).context("unknown pool")?;
+    if !pool_config.members.iter().any(|member| member == account) {
+        bail!("account {account} is not a member of pool {pool}")
+    }
+    let _guard = edit_lock.lock().await;
+    let mut text = fs::read_to_string(config_path)?;
+    let saved: Config = toml::from_str(&text)?;
+    let saved_pool = saved.pools.get(pool).context("unknown pool")?;
+    if !saved_pool.members.iter().any(|member| member == account) {
+        bail!("account {account} is not a member of pool {pool}")
+    }
+    if saved_pool.preferred.as_deref() == Some(account) {
+        text = accounts::set_preferred_account(&text, pool, None)?;
+    }
+    if saved_pool.preserved.as_deref() == Some(account) {
+        text = accounts::set_preserved_account(&text, pool, None)?;
+    }
+    text = match role {
+        AccountRole::Preferred => accounts::set_preferred_account(&text, pool, Some(account))?,
+        AccountRole::Preserved => accounts::set_preserved_account(&text, pool, Some(account))?,
+        AccountRole::Normal => text,
+    };
+    let updated: Config = toml::from_str(&text)?;
+    let order = &updated.pools[pool];
+    config::write_validated(config_path, &text)?;
+    router
+        .set_account_order(pool, order.preferred.clone(), order.preserved.clone())
+        .await;
     Ok(())
 }
 
@@ -979,11 +1052,8 @@ async fn build_ui_status(
         .map(|(name, pool)| UiPoolStatus {
             name: name.clone(),
             members: pool.members.clone(),
-            preferred: routing
-                .preferred_accounts
-                .get(name)
-                .cloned()
-                .or_else(|| pool.preferred.clone()),
+            preferred: routing.preferred_accounts.get(name).cloned(),
+            preserved: routing.preserved_accounts.get(name).cloned(),
             // Display honesty (fix1): `active` = last fresh pick only; `wired` = last
             // actually-sent account (bound traffic included). Never derive one from other.
             active: routing.active_accounts.get(name).cloned(),
@@ -1151,6 +1221,7 @@ pool = "default"
 
 [pools.default]
 members = ["a", "b"]
+preferred = "a"
 
 [accounts.a]
 kind = "inbound"
@@ -1340,6 +1411,97 @@ kind = "inbound"
                     .is_empty()
             );
         }
+
+        // UI roles move directly between preferred and preserved, replacing only that role.
+        for (account, role, preferred, preserved) in [
+            ("b", "preserved", None, Some("b")),
+            ("a", "preferred", Some("a"), Some("b")),
+            ("b", "preferred", Some("b"), None),
+            ("a", "preserved", Some("b"), Some("a")),
+            ("b", "preserved", None, Some("b")),
+            ("a", "normal", None, Some("b")),
+            ("b", "normal", None, None),
+            ("a", "preferred", Some("a"), None),
+            ("a", "normal", None, None),
+        ] {
+            let state = state_dir.clone();
+            let response = tokio::task::spawn_blocking(move || send_raw(&state, serde_json::json!({
+                "command": "ui_set_account_role", "pool": "default", "account": account, "role": role
+            }))).await.unwrap();
+            assert!(response.ok, "{:?}", response.error);
+            let status = response.status.unwrap();
+            assert_eq!(status.pools[0].preferred.as_deref(), preferred);
+            assert_eq!(status.pools[0].preserved.as_deref(), preserved);
+            let saved = Config::load(&config_path).unwrap();
+            assert_eq!(saved.pools["default"].preferred.as_deref(), preferred);
+            assert_eq!(saved.pools["default"].preserved.as_deref(), preserved);
+            let live = router.routing_snapshot().await;
+            assert_eq!(
+                live.preferred_accounts.get("default").map(String::as_str),
+                preferred
+            );
+            assert_eq!(
+                live.preserved_accounts.get("default").map(String::as_str),
+                preserved
+            );
+            let restarted = Router::new(&saved, router.affinity.clone());
+            assert_eq!(
+                restarted.routing_snapshot().await.preserved_accounts,
+                live.preserved_accounts
+            );
+            // Changing roles never moves the already-bound conversation.
+            assert_eq!(
+                router
+                    .select(
+                        "default",
+                        &config.pools["default"],
+                        Some(router.affinity.key("fresh")),
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .account_id,
+                "b"
+            );
+        }
+        for (pool, account) in [("missing", "a"), ("default", "missing")] {
+            let before = fs::read_to_string(&config_path).unwrap();
+            let state = state_dir.clone();
+            let response = tokio::task::spawn_blocking(move || send_raw(&state, serde_json::json!({
+                "command": "ui_set_account_role", "pool": pool, "account": account, "role": "preserved"
+            }))).await.unwrap();
+            assert!(!response.ok);
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+            assert!(
+                router
+                    .routing_snapshot()
+                    .await
+                    .preserved_accounts
+                    .is_empty()
+            );
+        }
+
+        let valid = fs::read_to_string(&config_path).unwrap();
+        let invalid = valid.replace(
+            "members = [\"a\", \"b\"]",
+            "members = [\"a\", \"b\", \"missing\"]",
+        );
+        fs::write(&config_path, &invalid).unwrap();
+        let state = state_dir.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            send_raw(&state, serde_json::json!({
+                "command": "ui_set_account_role", "pool": "default", "account": "a", "role": "preserved"
+            }))
+        }).await.unwrap();
+        assert!(!response.ok);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), invalid);
+        assert!(
+            router
+                .routing_snapshot()
+                .await
+                .preserved_accounts
+                .is_empty()
+        );
 
         task.abort();
         let _ = task.await;

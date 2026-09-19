@@ -3,6 +3,7 @@ import Foundation
 
 enum UIControlCommand: Equatable, Sendable {
     case status
+    case setAccountRole(pool: String, account: String, role: AccountRole)
     case setPreferred(pool: String, account: String?)
     case startLogin(account: String)
     case connectExistingLogin(account: String)
@@ -19,6 +20,8 @@ enum UIControlCommand: Equatable, Sendable {
                 "pool": pool,
                 "account": account ?? NSNull(),
             ]
+        case .setAccountRole(let pool, let account, let role):
+            object = ["command": "ui_set_account_role", "pool": pool, "account": account, "role": role.rawValue]
         case .startLogin(let account):
             object = ["command": "ui_start_login", "account": account]
         case .connectExistingLogin(let account):
@@ -60,6 +63,7 @@ enum ControlSocketError: LocalizedError {
 
 protocol ControlServing: Sendable {
     func status() async throws -> UIStatusSnapshot
+    func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot?
     func startLogin(account: String) async throws -> LoginSnapshot
     func connectExistingLogin(account: String) async throws
@@ -92,6 +96,11 @@ final class ControlSocketClient: ControlServing, @unchecked Sendable {
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? {
         _ = try await request(.setPreferred(pool: pool, account: account))
         return nil
+    }
+
+    func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot {
+        let data = try await request(.setAccountRole(pool: pool, account: account, role: role))
+        return try Self.decode(UIStatusSnapshot.self, from: data, preferredKeys: ["status"])
     }
 
     func startLogin(account: String) async throws -> LoginSnapshot {
