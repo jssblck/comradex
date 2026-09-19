@@ -1,15 +1,17 @@
 import AppKit
 import SwiftUI
 
-private final class AccountRoleAction: NSObject {
+private final class AccountSettingAction: NSObject {
     let pool: String
     let account: String
-    let role: AccountRole
+    let setting: AccountSetting
+    let enabled: Bool
 
-    init(pool: String, account: String, role: AccountRole) {
+    init(pool: String, account: String, setting: AccountSetting, enabled: Bool) {
         self.pool = pool
         self.account = account
-        self.role = role
+        self.setting = setting
+        self.enabled = enabled
     }
 }
 
@@ -170,28 +172,26 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let hasRunningLogin = store.isLoginRunning && store.login?.account == account.name
         let loginAction = account.needsLoginAction || account.isLoginInProgress || hasRunningLogin
         let detail = hasRunningLogin ? "Login in progress…" : accountDetail(account)
-        let roleLabel = isPreferred ? "Preferred" : isPreserved ? "Preserved" : nil
         let item = NSMenuItem(
-            title: [account.name, detail.isEmpty ? nil : detail, roleLabel].compactMap { $0 }.joined(separator: " · "),
+            title: [account.name, detail.isEmpty ? nil : detail].compactMap { $0 }.joined(separator: " · "),
             action: nil,
             keyEquivalent: ""
         )
-        item.state = isLastUsed ? .on : .off
-        item.toolTip = [isLastUsed ? "Last used for an upstream request" : nil, roleLabel, accountDetail(account, expanded: true)]
+        item.toolTip = [isLastUsed ? "Last used for an upstream request" : nil, accountDetail(account, expanded: true)]
             .compactMap { $0 }.joined(separator: " · ")
         let submenu = NSMenu()
         submenu.autoenablesItems = false
         if let pool {
             submenu.addItem(.sectionHeader(title: "Routing in \(pool.name)"))
-            let current: AccountRole = isPreferred ? .preferred : isPreserved ? .preserved : .normal
-            for role in AccountRole.allCases {
+            for setting in AccountSetting.allCases {
+                let isEnabled = setting == .preferred ? isPreferred : isPreserved
                 let choice = actionItem(
-                    title: role.title,
-                    action: #selector(accountRoleSelected(_:)),
+                    title: setting.title,
+                    action: #selector(accountSettingSelected(_:)),
                     enabled: store.updatingPool == nil && store.connectingAccount == nil
                 )
-                choice.state = role == current ? .on : .off
-                choice.representedObject = AccountRoleAction(pool: pool.name, account: account.name, role: role)
+                choice.state = isEnabled ? .on : .off
+                choice.representedObject = AccountSettingAction(pool: pool.name, account: account.name, setting: setting, enabled: !isEnabled)
                 choice.toolTip = "Applies to new work. Existing conversations keep their account."
                 submenu.addItem(choice)
             }
@@ -268,11 +268,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         NSApplication.shared.terminate(nil)
     }
 
-    @objc private func accountRoleSelected(_ sender: NSMenuItem) {
-        guard let selection = sender.representedObject as? AccountRoleAction else { return }
+    @objc private func accountSettingSelected(_ sender: NSMenuItem) {
+        guard let selection = sender.representedObject as? AccountSettingAction else { return }
         Task { [weak self] in
             guard let self else { return }
-            await store.setAccountRole(pool: selection.pool, account: selection.account, role: selection.role)
+            await store.setAccountSetting(pool: selection.pool, account: selection.account, setting: selection.setting, enabled: selection.enabled)
             rebuildMenu()
         }
     }

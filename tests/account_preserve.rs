@@ -115,10 +115,8 @@ kind = "inbound"
     assert_eq!(routing.preserved_accounts["default"], "grace");
     assert_eq!(routing.preserved_accounts["research"], "ada");
     for args in [
-        vec!["account", "preserve", "ada"],
         vec!["account", "preserve", "missing"],
         vec!["account", "preserve", "grace", "--pool", "missing"],
-        vec!["account", "prefer", "grace"],
     ] {
         let before = fs::read(&path).unwrap();
         assert!(!cli(&path, &args).status.success());
@@ -130,6 +128,19 @@ kind = "inbound"
             routing.preserved_accounts
         );
     }
+    // Both directions permit overlap without erasing the other setting.
+    preserve(&path, &["ada"]);
+    let both = control::routing_status(&state, SECRET).unwrap();
+    assert_eq!(both.preferred_accounts["default"], "ada");
+    assert_eq!(both.preserved_accounts["default"], "ada");
+    preserve(&path, &["grace"]);
+    assert!(cli(&path, &["account", "prefer", "grace"]).status.success());
+    let both = control::routing_status(&state, SECRET).unwrap();
+    assert_eq!(both.preferred_accounts["default"], "grace");
+    assert_eq!(both.preserved_accounts["default"], "grace");
+    let saved = Config::load(&path).unwrap();
+    assert_eq!(saved.pools["default"].preferred.as_deref(), Some("grace"));
+    assert_eq!(saved.pools["default"].preserved.as_deref(), Some("grace"));
     preserve(&path, &["--clear", "--pool", "research"]);
     let routing = control::routing_status(&state, SECRET).unwrap();
     assert_eq!(routing.preserved_accounts.len(), 1);
@@ -144,7 +155,19 @@ kind = "inbound"
             .preserved_accounts,
         routing.preserved_accounts
     );
+    assert_eq!(
+        control::routing_status(&state, SECRET)
+            .unwrap()
+            .preferred_accounts["default"],
+        "grace"
+    );
     preserve(&path, &["--clear"]);
+    assert_eq!(
+        control::routing_status(&state, SECRET)
+            .unwrap()
+            .preferred_accounts["default"],
+        "grace"
+    );
     assert!(
         control::routing_status(&state, SECRET)
             .unwrap()

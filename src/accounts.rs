@@ -185,12 +185,12 @@ pub fn remove_account(text: &str, name: &str) -> Result<(String, Option<String>)
 
 /// Set or clear the preferred account for a pool while preserving surrounding formatting.
 pub fn set_preferred_account(text: &str, pool_name: &str, account: Option<&str>) -> Result<String> {
-    set_account_order(text, pool_name, account, "preferred", "preserved")
+    set_account_order(text, pool_name, account, "preferred")
 }
 
 /// Set or clear the account reserved for last use in a pool.
 pub fn set_preserved_account(text: &str, pool_name: &str, account: Option<&str>) -> Result<String> {
-    set_account_order(text, pool_name, account, "preserved", "preferred")
+    set_account_order(text, pool_name, account, "preserved")
 }
 
 fn set_account_order(
@@ -198,7 +198,6 @@ fn set_account_order(
     pool_name: &str,
     account: Option<&str>,
     field: &str,
-    opposite: &str,
 ) -> Result<String> {
     if let Some(account) = account {
         validate_name(account)?;
@@ -223,11 +222,6 @@ fn set_account_order(
                 });
             if !is_member {
                 bail!("account {account} is not a member of pool {pool_name}")
-            }
-            if pool.get(opposite).and_then(Item::as_str) == Some(account) {
-                bail!(
-                    "pool {pool_name} cannot prefer and preserve the same account; clear {opposite} first"
-                )
             }
             pool.insert(field, value(account));
         }
@@ -486,9 +480,9 @@ kind = "inbound"
         );
         assert!(set_preserved_account(&added, "default", Some("missing")).is_err());
         assert!(set_preserved_account(&added, "missing", Some("work2")).is_err());
-        assert!(set_preferred_account(&saved, "default", Some("work2")).is_err());
+        assert!(set_preferred_account(&saved, "default", Some("work2")).is_ok());
         let preferred = set_preferred_account(&added, "default", Some("work2")).unwrap();
-        assert!(set_preserved_account(&preferred, "default", Some("work2")).is_err());
+        assert!(set_preserved_account(&preferred, "default", Some("work2")).is_ok());
         assert!(set_preferred_account(&saved, "default", Some("caller")).is_ok());
     }
 

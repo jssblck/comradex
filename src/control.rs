@@ -51,6 +51,13 @@ enum AccountRole {
     Preserved,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccountSetting {
+    Preferred,
+    Preserved,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum Request {
@@ -72,6 +79,12 @@ enum Request {
         pool: String,
         account: String,
         role: AccountRole,
+    },
+    UiSetAccountSetting {
+        pool: String,
+        account: String,
+        setting: AccountSetting,
+        enabled: bool,
     },
     UiSetPreferred {
         pool: String,
@@ -98,6 +111,7 @@ impl Request {
             | Self::RoutingStatus { secret } => Some(secret),
             Self::UiStatus
             | Self::UiSetAccountRole { .. }
+            | Self::UiSetAccountSetting { .. }
             | Self::UiSetPreferred { .. }
             | Self::UiStartLogin { .. }
             | Self::UiConnectExistingLogin { .. }
@@ -762,6 +776,28 @@ async fn process(
                 update_preserved(config_path, config, router, edit_lock, &pool, account).await?;
                 Response::routing(router.routing_snapshot().await)
             }
+            Request::UiSetAccountSetting {
+                pool,
+                account,
+                setting,
+                enabled,
+            } => {
+                let role = match setting {
+                    AccountSetting::Preferred => AccountRole::Preferred,
+                    AccountSetting::Preserved => AccountRole::Preserved,
+                };
+                update_account_role(
+                    config_path,
+                    config,
+                    router,
+                    edit_lock,
+                    &pool,
+                    &account,
+                    AccountOrderChange { role, enabled },
+                )
+                .await?;
+                Response::status(build_ui_status(config, router, stats, login_manager).await)
+            }
             Request::UiSetAccountRole {
                 pool,
                 account,
@@ -774,7 +810,10 @@ async fn process(
                     edit_lock,
                     &pool,
                     &account,
-                    role,
+                    AccountOrderChange {
+                        role,
+                        enabled: true,
+                    },
                 )
                 .await?;
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
@@ -877,7 +916,13 @@ async fn update_preferred(
     Ok(())
 }
 
-// Change one account's role against the latest saved settings, never a stale UI snapshot.
+struct AccountOrderChange {
+    role: AccountRole,
+    enabled: bool,
+}
+
+// Change only the requested setting against the latest saved configuration.
+// Legacy Normal clears both settings owned by this account.
 async fn update_account_role(
     config_path: &Path,
     config: &Config,
@@ -885,7 +930,7 @@ async fn update_account_role(
     edit_lock: &Mutex<()>,
     pool: &str,
     account: &str,
-    role: AccountRole,
+    change: AccountOrderChange,
 ) -> Result<()> {
     let pool_config = config.pools.get(pool).context("unknown pool")?;
     if !pool_config.members.iter().any(|member| member == account) {
@@ -898,17 +943,31 @@ async fn update_account_role(
     if !saved_pool.members.iter().any(|member| member == account) {
         bail!("account {account} is not a member of pool {pool}")
     }
-    if saved_pool.preferred.as_deref() == Some(account) {
-        text = accounts::set_preferred_account(&text, pool, None)?;
+    let owns_preferred = saved_pool.preferred.as_deref() == Some(account);
+    let owns_preserved = saved_pool.preserved.as_deref() == Some(account);
+    match change.role {
+        AccountRole::Preferred if change.enabled => {
+            text = accounts::set_preferred_account(&text, pool, Some(account))?;
+        }
+        AccountRole::Preserved if change.enabled => {
+            text = accounts::set_preserved_account(&text, pool, Some(account))?;
+        }
+        AccountRole::Preferred if owns_preferred => {
+            text = accounts::set_preferred_account(&text, pool, None)?;
+        }
+        AccountRole::Preserved if owns_preserved => {
+            text = accounts::set_preserved_account(&text, pool, None)?;
+        }
+        AccountRole::Normal => {
+            if owns_preferred {
+                text = accounts::set_preferred_account(&text, pool, None)?;
+            }
+            if owns_preserved {
+                text = accounts::set_preserved_account(&text, pool, None)?;
+            }
+        }
+        _ => {}
     }
-    if saved_pool.preserved.as_deref() == Some(account) {
-        text = accounts::set_preserved_account(&text, pool, None)?;
-    }
-    text = match role {
-        AccountRole::Preferred => accounts::set_preferred_account(&text, pool, Some(account))?,
-        AccountRole::Preserved => accounts::set_preserved_account(&text, pool, Some(account))?,
-        AccountRole::Normal => text,
-    };
     let updated: Config = toml::from_str(&text)?;
     let order = &updated.pools[pool];
     config::write_validated(config_path, &text)?;
@@ -1391,7 +1450,7 @@ kind = "inbound"
                 routing.preserved_accounts
             );
         }
-        for account in ["b", "missing"] {
+        for account in ["missing"] {
             let before = fs::read_to_string(&config_path).unwrap();
             let state = state_dir.clone();
             assert!(
@@ -1412,14 +1471,14 @@ kind = "inbound"
             );
         }
 
-        // UI roles move directly between preferred and preserved, replacing only that role.
+        // Legacy role commands set one independent setting; Normal clears this account.
         for (account, role, preferred, preserved) in [
-            ("b", "preserved", None, Some("b")),
+            ("b", "preserved", Some("b"), Some("b")),
             ("a", "preferred", Some("a"), Some("b")),
-            ("b", "preferred", Some("b"), None),
+            ("b", "preferred", Some("b"), Some("b")),
             ("a", "preserved", Some("b"), Some("a")),
-            ("b", "preserved", None, Some("b")),
-            ("a", "normal", None, Some("b")),
+            ("b", "preserved", Some("b"), Some("b")),
+            ("a", "normal", Some("b"), Some("b")),
             ("b", "normal", None, None),
             ("a", "preferred", Some("a"), None),
             ("a", "normal", None, None),
@@ -1463,6 +1522,46 @@ kind = "inbound"
                     .account_id,
                 "b"
             );
+        }
+        // Each setting survives changes to the other, including stale disable actions.
+        for (account, setting, enabled, preferred, preserved) in [
+            ("a", "preferred", true, Some("a"), None),
+            ("a", "preserved", true, Some("a"), Some("a")),
+            ("a", "preferred", false, None, Some("a")),
+            ("a", "preferred", true, Some("a"), Some("a")),
+            ("a", "preserved", false, Some("a"), None),
+            ("a", "preserved", true, Some("a"), Some("a")),
+            ("b", "preferred", true, Some("b"), Some("a")),
+            ("a", "preferred", false, Some("b"), Some("a")),
+            ("b", "preserved", false, Some("b"), Some("a")),
+            ("b", "preferred", false, None, Some("a")),
+            ("a", "preserved", false, None, None),
+        ] {
+            let state = state_dir.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                send_raw(
+                    &state,
+                    serde_json::json!({
+                        "command": "ui_set_account_setting", "pool": "default", "account": account,
+                        "setting": setting, "enabled": enabled
+                    }),
+                )
+            })
+            .await
+            .unwrap();
+            assert!(response.ok, "{:?}", response.error);
+            let status = response.status.unwrap();
+            assert_eq!(status.pools[0].preferred.as_deref(), preferred);
+            assert_eq!(status.pools[0].preserved.as_deref(), preserved);
+            let saved = Config::load(&config_path).unwrap();
+            assert_eq!(saved.pools["default"].preferred.as_deref(), preferred);
+            assert_eq!(saved.pools["default"].preserved.as_deref(), preserved);
+            let live = router.routing_snapshot().await;
+            let restarted = Router::new(&saved, router.affinity.clone())
+                .routing_snapshot()
+                .await;
+            assert_eq!(live.preferred_accounts, restarted.preferred_accounts);
+            assert_eq!(live.preserved_accounts, restarted.preserved_accounts);
         }
         for (pool, account) in [("missing", "a"), ("default", "missing")] {
             let before = fs::read_to_string(&config_path).unwrap();

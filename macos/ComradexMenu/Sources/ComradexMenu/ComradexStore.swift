@@ -69,13 +69,13 @@ final class ComradexStore: ObservableObject {
         }
     }
 
-    func setAccountRole(pool: String, account: String, role: AccountRole) async {
+    func setAccountSetting(pool: String, account: String, setting: AccountSetting, enabled: Bool) async {
         guard updatingPool == nil, connectingAccount == nil else { return }
         updatingPool = pool
         statusGeneration &+= 1
         defer { updatingPool = nil }
         do {
-            let updated = try await client.setAccountRole(pool: pool, account: account, role: role)
+            let updated = try await client.setAccountSetting(pool: pool, account: account, setting: setting, enabled: enabled)
             apply(status: updated)
             actionErrorMessage = nil
         } catch {

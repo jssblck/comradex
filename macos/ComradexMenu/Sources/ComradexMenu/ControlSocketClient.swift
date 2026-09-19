@@ -3,7 +3,7 @@ import Foundation
 
 enum UIControlCommand: Equatable, Sendable {
     case status
-    case setAccountRole(pool: String, account: String, role: AccountRole)
+    case setAccountSetting(pool: String, account: String, setting: AccountSetting, enabled: Bool)
     case setPreferred(pool: String, account: String?)
     case startLogin(account: String)
     case connectExistingLogin(account: String)
@@ -20,8 +20,8 @@ enum UIControlCommand: Equatable, Sendable {
                 "pool": pool,
                 "account": account ?? NSNull(),
             ]
-        case .setAccountRole(let pool, let account, let role):
-            object = ["command": "ui_set_account_role", "pool": pool, "account": account, "role": role.rawValue]
+        case .setAccountSetting(let pool, let account, let setting, let enabled):
+            object = ["command": "ui_set_account_setting", "pool": pool, "account": account, "setting": setting.rawValue, "enabled": enabled]
         case .startLogin(let account):
             object = ["command": "ui_start_login", "account": account]
         case .connectExistingLogin(let account):
@@ -63,7 +63,7 @@ enum ControlSocketError: LocalizedError {
 
 protocol ControlServing: Sendable {
     func status() async throws -> UIStatusSnapshot
-    func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot
+    func setAccountSetting(pool: String, account: String, setting: AccountSetting, enabled: Bool) async throws -> UIStatusSnapshot
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot?
     func startLogin(account: String) async throws -> LoginSnapshot
     func connectExistingLogin(account: String) async throws
@@ -98,8 +98,8 @@ final class ControlSocketClient: ControlServing, @unchecked Sendable {
         return nil
     }
 
-    func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot {
-        let data = try await request(.setAccountRole(pool: pool, account: account, role: role))
+    func setAccountSetting(pool: String, account: String, setting: AccountSetting, enabled: Bool) async throws -> UIStatusSnapshot {
+        let data = try await request(.setAccountSetting(pool: pool, account: account, setting: setting, enabled: enabled))
         return try Self.decode(UIStatusSnapshot.self, from: data, preferredKeys: ["status"])
     }
 

@@ -40,7 +40,7 @@ final class ComradexMenuTests: XCTestCase {
         let items = controller.renderedMenu.items
         XCTAssertFalse(controller.renderedMenu.autoenablesItems)
         XCTAssertFalse(items.contains { $0.title.contains("default") || $0.title.contains("Active:") })
-        let app = try XCTUnwrap(items.first(where: { $0.title == "app · Requesting client’s login · Preferred" }))
+        let app = try XCTUnwrap(items.first(where: { $0.title == "app · Requesting client’s login" }))
         let connect = try XCTUnwrap(app.submenu?.items.first(where: { $0.title == "Connect existing Codex login…" }))
         XCTAssertEqual(connect.representedObject as? String, "app")
         XCTAssertTrue(connect.isEnabled)
@@ -49,12 +49,12 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertEqual(app.state, .off)
         XCTAssertNil(app.image)
         XCTAssertNil(app.subtitle)
-        XCTAssertEqual(app.toolTip, "Preferred · Requesting client’s login")
+        XCTAssertEqual(app.toolTip, "Requesting client’s login")
         let sq = try XCTUnwrap(items.first(where: { $0.title.hasPrefix("sq · 81% left · ") }))
         XCTAssertFalse(sq.title.contains("resets in"))
         XCTAssertFalse(sq.title.contains("19%"))
         XCTAssertNotNil(sq.submenu)
-        XCTAssertEqual(sq.state, .on)
+        XCTAssertEqual(sq.state, .off)
         XCTAssertNil(sq.image)
         XCTAssertTrue(sq.toolTip?.contains("Last used") == true)
         XCTAssertNil(sq.subtitle)
@@ -97,7 +97,7 @@ final class ComradexMenuTests: XCTestCase {
             ]))
             let controller = MenuBarController(store: store)
             controller.rebuildMenu()
-            let item = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "work · \(detail) · Preferred" })
+            let item = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "work · \(detail)" })
             XCTAssertNil(item.subtitle)
             XCTAssertEqual(item.state, .off)
             XCTAssertFalse(item.toolTip?.contains("0d") == true)
@@ -219,7 +219,7 @@ final class ComradexMenuTests: XCTestCase {
             XCTAssertTrue(sq.submenu?.items.last?.toolTip?.contains("without changing") == true)
             XCTAssertFalse(rows.contains { $0.title.hasPrefix("Re-login ") })
             let preferred = try XCTUnwrap(rows.first { $0.title.hasPrefix("pm · ") })
-            XCTAssertEqual(preferred.submenu?.items[1].action.map(NSStringFromSelector), "accountRoleSelected:")
+            XCTAssertEqual(preferred.submenu?.items[1].action.map(NSStringFromSelector), "accountSettingSelected:")
             XCTAssertEqual(preferred.submenu?.items[1].state, .on)
             XCTAssertEqual(preferred.state, .off)
         }
@@ -466,7 +466,7 @@ final class ComradexMenuTests: XCTestCase {
             let store = ComradexStore(client: client)
             let poll = Task { await store.refresh() }
             await fulfillment(of: [entered], timeout: 2)
-            await store.setAccountRole(pool: "default", account: "pm", role: .preferred)
+            await store.setAccountSetting(pool: "default", account: "pm", setting: .preferred, enabled: true)
             XCTAssertEqual(store.snapshot?.pools.first?.preferred, "pm")
             await client.completeOldPoll()
             await poll.value
@@ -594,7 +594,7 @@ final class ComradexMenuTests: XCTestCase {
     }
 
     @MainActor
-    func testRolesKeepAppUsageAndOnlyWiredAccountGetsCheckmark() throws {
+    func testRolesStayInSubmenusAndLastUsedStaysInTooltip() throws {
         let data = Data(#"""
         {"accounts":[
           {"name":"app","kind":"codex_home","signed_in":true,"auth_state":"signed_in","usage_windows":{"primary":{"used_percent":83,"reset_at_unix":4102444800,"limit_window_seconds":18000}}},
@@ -607,24 +607,107 @@ final class ComradexMenuTests: XCTestCase {
         let controller = MenuBarController(store: store)
         controller.rebuildMenu()
         let app = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("app · 17% left · ") })
-        XCTAssertTrue(app.title.hasSuffix(" · Preserved"))
+        XCTAssertFalse(app.title.contains("Preserved"))
         XCTAssertTrue(app.toolTip?.contains("resets in") == true)
-        XCTAssertEqual(app.state, .on)
+        XCTAssertEqual(app.state, .off)
         XCTAssertNil(app.image)
         let choices = try XCTUnwrap(app.submenu).items.filter { $0.action != nil }
-        XCTAssertEqual(choices.map(\.title), AccountRole.allCases.map(\.title))
-        XCTAssertEqual(choices.map(\.state), [.off, .off, .on])
-        let sq = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "sq · 71% left · Preferred" })
+        XCTAssertEqual(choices.map(\.title), AccountSetting.allCases.map(\.title))
+        XCTAssertEqual(choices.map(\.state), [.off, .on])
+        let sq = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "sq · 71% left" })
         XCTAssertEqual(sq.state, .off)
         XCTAssertNil(sq.image)
         XCTAssertEqual(sq.submenu?.items[1].state, .on)
+        XCTAssertFalse(controller.renderedMenu.items.contains {
+            $0.title.contains("Preferred") || $0.title.contains("Preserved")
+        })
+        XCTAssertTrue(controller.renderedMenu.items.allSatisfy { $0.state == .off })
     }
 
-    func testAccountRoleCommandEncoding() throws {
-        for role in AccountRole.allCases {
-            let data = try UIControlCommand.setAccountRole(pool: "work", account: "app", role: role).encoded()
-            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
-            XCTAssertEqual(object, ["command": "ui_set_account_role", "pool": "work", "account": "app", "role": role.rawValue])
+    @MainActor
+    func testPreferredAndLastUsedRemainDistinctWithoutDuplicateCheckmarks() throws {
+        let account = try decodeAccount(#"{"name":"app","kind":"codex_home","signed_in":true,"auth_state":"signed_in","usage_percent":83}"#)
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(accounts: [account], pools: [
+            PoolSnapshot(
+                name: "default",
+                members: ["app"],
+                preferred: "app",
+                active: "app",
+                wired: "app"
+            )
+        ]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+
+        let app = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "app · 17% left" })
+        XCTAssertEqual(app.state, .off)
+        XCTAssertEqual(app.submenu?.items.filter { $0.action != nil }.map(\.state), [.on, .off])
+        XCTAssertTrue(app.toolTip?.contains("Last used for an upstream request") == true)
+        XCTAssertFalse(app.toolTip?.contains("Preferred") == true)
+    }
+
+    func testAccountSettingCommandEncoding() throws {
+        for setting in AccountSetting.allCases {
+            for enabled in [false, true] {
+                let data = try UIControlCommand.setAccountSetting(pool: "work", account: "app", setting: setting, enabled: enabled).encoded()
+                let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                XCTAssertEqual(object["command"] as? String, "ui_set_account_setting")
+                XCTAssertEqual(object["pool"] as? String, "work")
+                XCTAssertEqual(object["account"] as? String, "app")
+                XCTAssertEqual(object["setting"] as? String, setting.rawValue)
+                XCTAssertEqual(object["enabled"] as? Bool, enabled)
+            }
+        }
+    }
+
+    @MainActor
+    func testIndependentSettingCheckmarks() throws {
+        let account = try decodeAccount(#"{"name":"app","kind":"codex_home","signed_in":true,"auth_state":"signed_in"}"#)
+        for preferred in [false, true] {
+            for preserved in [false, true] {
+                let store = ComradexStore(client: StubClient())
+                store.apply(status: UIStatusSnapshot(accounts: [account], pools: [
+                    PoolSnapshot(name: "default", members: ["app"], preferred: preferred ? "app" : nil,
+                                 active: nil, preserved: preserved ? "app" : nil)
+                ]))
+                let controller = MenuBarController(store: store)
+                controller.rebuildMenu()
+                let row = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("app") })
+                let choices = try XCTUnwrap(row.submenu).items.filter { $0.action != nil }
+                XCTAssertEqual(choices.map(\.state), [preferred ? .on : .off, preserved ? .on : .off])
+            }
+        }
+    }
+
+    @MainActor
+    func testMenuClicksSendIndependentEnableAndDisableCommands() async throws {
+        let account = try decodeAccount(#"{"name":"app","kind":"codex_home","signed_in":true,"auth_state":"signed_in"}"#)
+        for enabled in [false, true] {
+            for (index, setting) in AccountSetting.allCases.enumerated() {
+                let called = expectation(description: "setting command sent")
+                let snapshot = UIStatusSnapshot(accounts: [account], pools: [
+                    PoolSnapshot(name: "default", members: ["app"], preferred: enabled ? "app" : nil,
+                                 active: nil, preserved: enabled ? "app" : nil)
+                ])
+                let client = SettingRecordingClient(snapshot: snapshot) { pool, account, actualSetting, actualEnabled in
+                    XCTAssertEqual(pool, "default")
+                    XCTAssertEqual(account, "app")
+                    XCTAssertEqual(actualSetting, setting)
+                    XCTAssertEqual(actualEnabled, !enabled)
+                    called.fulfill()
+                }
+                let store = ComradexStore(client: client)
+                store.apply(status: snapshot)
+                let controller = MenuBarController(store: store)
+                controller.rebuildMenu()
+                let row = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("app") })
+                let choices = try XCTUnwrap(row.submenu).items.filter { $0.action != nil }
+                let choice = choices[index]
+                let target = try XCTUnwrap(choice.target as? NSObject)
+                target.perform(try XCTUnwrap(choice.action), with: choice)
+                await fulfillment(of: [called], timeout: 2)
+            }
         }
     }
 
@@ -633,7 +716,7 @@ final class ComradexMenuTests: XCTestCase {
         let store = ComradexStore(client: FailingClient())
         let before = UIStatusSnapshot(pools: [PoolSnapshot(name: "default", members: ["app"], preferred: "app", active: nil)])
         store.apply(status: before)
-        await store.setAccountRole(pool: "default", account: "app", role: .preserved)
+        await store.setAccountSetting(pool: "default", account: "app", setting: .preserved, enabled: true)
         XCTAssertEqual(store.snapshot?.pools, before.pools)
         XCTAssertNotNil(store.actionErrorMessage)
         XCTAssertNil(store.updatingPool)
@@ -748,7 +831,7 @@ private actor PreferenceRaceClient: ControlServing {
             PoolSnapshot(name: "default", members: ["sq", "pm"], preferred: preferred, active: nil)
         ])
     }
-    func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot {
+    func setAccountSetting(pool: String, account: String, setting: AccountSetting, enabled: Bool) async throws -> UIStatusSnapshot {
         preference = account
         return snapshot(preferred: preference)
     }
@@ -770,7 +853,21 @@ private struct SelectionWithoutStatusClient: ControlServing {
 }
 
 extension ControlServing {
-    func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot {
+    func setAccountSetting(pool: String, account: String, setting: AccountSetting, enabled: Bool) async throws -> UIStatusSnapshot {
         throw ControlSocketError.daemon("role change unavailable")
     }
+}
+
+private struct SettingRecordingClient: ControlServing {
+    let snapshot: UIStatusSnapshot
+    let onSetting: @Sendable (String, String, AccountSetting, Bool) -> Void
+    func status() async throws -> UIStatusSnapshot { snapshot }
+    func setAccountSetting(pool: String, account: String, setting: AccountSetting, enabled: Bool) async throws -> UIStatusSnapshot {
+        onSetting(pool, account, setting, enabled)
+        return snapshot
+    }
+    func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
+    func connectExistingLogin(account: String) async throws { throw ControlSocketError.emptyResponse }
+    func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+    func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
 }

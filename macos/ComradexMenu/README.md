@@ -1,12 +1,14 @@
 # Comradex Menu
 
-A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; choosing each account's routing role; and completing account login when authentication is required.
+A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; changing each account's routing settings; and completing account login when authentication is required.
 
-Each account occupies one line with its usage and reset countdown, including connected `app` accounts: `app · 17% left · 12h 15m · Preferred`. The primary quota window is shown; zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window's reset countdown (falling back to the retry deadline). Other authentication or availability errors replace stale usage details. Tooltips explicitly label reset countdowns.
+Each account occupies one line with its usage and reset countdown, including connected `app` accounts: `app · 17% left · 12h 15m`. The primary quota window is shown; zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window's reset countdown (falling back to the retry deadline). Other authentication or availability errors replace stale usage details. Tooltips explicitly label reset countdowns.
 
-The native check marks the account most recently used for an upstream request (`wired`), including bound conversations. It does not indicate routing preference or imply that only one account has work in flight. There is no dot indicator; before any upstream request, no account is checked. Preferred and Preserved appear as text labels. A single pool has no section header; multiple pools retain name-only section headers.
+Top-level account rows have no checkmarks or routing labels. The tooltip identifies the account most recently used for an upstream request (`wired`). A single pool has no section header; multiple pools retain name-only section headers.
 
-Each account opens a submenu with Preferred — use first, Normal — automatic selection, and Preserved — use last. The submenu checks the configured role. Each pool supports one preferred and one preserved account. Choosing a role replaces that role's previous holder; switching roles clears the selected account's opposite role atomically. Normal clears only the selected account's role. Preservation keeps an account available as a fallback, and existing conversations keep their bindings. Changes persist and apply live without restarting. Failed changes retain the previous displayed state and show an account-change error.
+Each account opens a submenu with independent Preferred — use first and Preserved — use last toggles. Both may be checked for the same account. Each pool supports one preferred and one preserved account; enabling either replaces only that setting's previous holder. Disabling either leaves the other setting unchanged. Preservation reserves the account for fallback even when it is also preferred. Existing conversations keep their bindings. Changes persist and apply live without restarting. Failed changes retain the previous displayed state and show an account-change error.
+
+The app starts directly as an AppKit menu-bar application without creating a Settings window.
 
 Sign In… appears within the submenu when authentication or renewal is needed; it does not change routing. During this app's login flow, Continue Sign In… reopens the same login window. The window distinguishes requesting a code from waiting for authorization, shows the selectable code, and provides Copy Code and browser controls. Starting another attempt clears the previous code. Inbound accounts offer Connect existing Codex login… in the submenu.
 
@@ -32,7 +34,7 @@ Scripts/compile_and_run.sh
 
 The package script always emits an `LSUIElement` menu-bar app (`MENU_BAR_APP=1`) and uses ad-hoc signing unless `APP_IDENTITY` is set. Set `ARCHES="arm64 x86_64"` for a universal build.
 
-The running daemon must implement `ui_status`, `ui_set_account_role`, `ui_start_login`, and `ui_login_status` on its existing user-only control socket.
+The running daemon must implement `ui_status`, `ui_set_account_setting`, `ui_start_login`, and `ui_login_status` on its existing user-only control socket.
 
 ## CLI coexistence
 
