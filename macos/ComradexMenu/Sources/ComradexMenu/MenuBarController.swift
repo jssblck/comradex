@@ -170,14 +170,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let hasRunningLogin = store.isLoginRunning && store.login?.account == account.name
         let loginAction = account.needsLoginAction || account.isLoginInProgress || hasRunningLogin
         let detail = hasRunningLogin ? "Login in progress…" : accountDetail(account)
-        let roleLabel = isPreferred ? "Preferred" : isPreserved ? "Preserved" : nil
         let item = NSMenuItem(
-            title: [account.name, detail.isEmpty ? nil : detail, roleLabel].compactMap { $0 }.joined(separator: " · "),
+            title: [account.name, detail.isEmpty ? nil : detail].compactMap { $0 }.joined(separator: " · "),
             action: nil,
             keyEquivalent: ""
         )
-        item.state = isLastUsed ? .on : .off
-        item.toolTip = [isLastUsed ? "Last used for an upstream request" : nil, roleLabel, accountDetail(account, expanded: true)]
+        item.toolTip = [isLastUsed ? "Last used for an upstream request" : nil, accountDetail(account, expanded: true)]
             .compactMap { $0 }.joined(separator: " · ")
         let submenu = NSMenu()
         submenu.autoenablesItems = false
