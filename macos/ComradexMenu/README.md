@@ -6,7 +6,7 @@ Each account occupies one line with its usage and reset countdown, including con
 
 Top-level account rows have no checkmarks or routing labels. The tooltip identifies the account most recently used for an upstream request (`wired`). A single pool has no section header; multiple pools retain name-only section headers.
 
-Each account opens a submenu with independent Preferred — use first and Preserved — use last toggles. Both may be checked for the same account. Each pool supports one preferred and one preserved account; enabling either replaces only that setting's previous holder. Disabling either leaves the other setting unchanged. Preservation reserves the account for fallback even when it is also preferred. Existing conversations keep their bindings. Changes persist and apply live without restarting. Failed changes retain the previous displayed state and show an account-change error.
+Each account opens a submenu with three choices: Automatic — quota-aware selection, Preferred — use first, and Preserved — use last. Exactly one is checked. Preserved saves that account's quota for use outside Comradex by using other available accounts first. Selecting a choice applies immediately, without a confirmation window. Choosing Preferred stops preserving that account; choosing Preserved removes its preference; Automatic clears either setting for that account. Each pool supports one preferred and one preserved account. Existing conversations keep their bindings. Changes persist and apply live without restarting. Failed changes retain the previous displayed state and show an account-change error.
 
 The app starts directly as an AppKit menu-bar application without creating a Settings window.
 
@@ -34,7 +34,7 @@ Scripts/compile_and_run.sh
 
 The package script always emits an `LSUIElement` menu-bar app (`MENU_BAR_APP=1`) and uses ad-hoc signing unless `APP_IDENTITY` is set. Set `ARCHES="arm64 x86_64"` for a universal build.
 
-The running daemon must implement `ui_status`, `ui_set_account_setting`, `ui_start_login`, and `ui_login_status` on its existing user-only control socket.
+The running daemon must implement `ui_status`, `ui_set_account_role`, `ui_start_login`, and `ui_login_status` on its existing user-only control socket.
 
 ## CLI coexistence
 

@@ -121,12 +121,13 @@ struct UsageWindowSnapshot: Codable, Equatable, Sendable {
     }
 }
 
-enum AccountSetting: String, CaseIterable, Sendable {
-    case preferred, preserved
+enum AccountRole: String, CaseIterable, Sendable {
+    case normal, preferred, preserved
 
     var title: String {
         switch self {
         case .preferred: return "Preferred — use first"
+        case .normal: return "Automatic — quota-aware selection"
         case .preserved: return "Preserved — use last"
         }
     }

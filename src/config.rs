@@ -373,12 +373,15 @@ impl Config {
                     )
                 }
             }
-            if let Some(preserved) = &pool.preserved
-                && !pool.members.contains(preserved)
-            {
-                bail!(
-                    "pool {pool_name} preserves account {preserved}, which is not one of its members"
-                )
+            if let Some(preserved) = &pool.preserved {
+                if !pool.members.contains(preserved) {
+                    bail!(
+                        "pool {pool_name} preserves account {preserved}, which is not one of its members"
+                    )
+                }
+                if pool.preferred.as_ref() == Some(preserved) {
+                    bail!("pool {pool_name} cannot prefer and preserve the same account")
+                }
             }
             if let Some(preferred) = &pool.preferred
                 && !pool.members.contains(preferred)
@@ -676,7 +679,7 @@ kind = "inbound"
     }
 
     #[test]
-    fn preserved_account_must_be_a_member_and_can_be_preferred() {
+    fn preserved_account_must_be_a_member_and_cannot_be_preferred() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("comradex.toml");
         for settings in [
@@ -688,7 +691,7 @@ kind = "inbound"
                 &format!("members = [\"caller\"]\n{settings}"),
             );
             fs::write(&path, text).unwrap();
-            assert_eq!(Config::load(&path).is_ok(), !settings.contains("missing"));
+            assert!(Config::load(&path).is_err());
         }
     }
 

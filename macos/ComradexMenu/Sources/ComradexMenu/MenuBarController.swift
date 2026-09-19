@@ -1,17 +1,15 @@
 import AppKit
 import SwiftUI
 
-private final class AccountSettingAction: NSObject {
+private final class AccountRoleAction: NSObject {
     let pool: String
     let account: String
-    let setting: AccountSetting
-    let enabled: Bool
+    let role: AccountRole
 
-    init(pool: String, account: String, setting: AccountSetting, enabled: Bool) {
+    init(pool: String, account: String, role: AccountRole) {
         self.pool = pool
         self.account = account
-        self.setting = setting
-        self.enabled = enabled
+        self.role = role
     }
 }
 
@@ -183,15 +181,15 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         submenu.autoenablesItems = false
         if let pool {
             submenu.addItem(.sectionHeader(title: "Routing in \(pool.name)"))
-            for setting in AccountSetting.allCases {
-                let isEnabled = setting == .preferred ? isPreferred : isPreserved
+            let current: AccountRole = isPreferred ? .preferred : isPreserved ? .preserved : .normal
+            for role in AccountRole.allCases {
                 let choice = actionItem(
-                    title: setting.title,
-                    action: #selector(accountSettingSelected(_:)),
+                    title: role.title,
+                    action: #selector(accountRoleSelected(_:)),
                     enabled: store.updatingPool == nil && store.connectingAccount == nil
                 )
-                choice.state = isEnabled ? .on : .off
-                choice.representedObject = AccountSettingAction(pool: pool.name, account: account.name, setting: setting, enabled: !isEnabled)
+                choice.state = role == current ? .on : .off
+                choice.representedObject = AccountRoleAction(pool: pool.name, account: account.name, role: role)
                 choice.toolTip = "Applies to new work. Existing conversations keep their account."
                 submenu.addItem(choice)
             }
@@ -268,11 +266,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         NSApplication.shared.terminate(nil)
     }
 
-    @objc private func accountSettingSelected(_ sender: NSMenuItem) {
-        guard let selection = sender.representedObject as? AccountSettingAction else { return }
+    @objc private func accountRoleSelected(_ sender: NSMenuItem) {
+        guard let selection = sender.representedObject as? AccountRoleAction else { return }
         Task { [weak self] in
             guard let self else { return }
-            await store.setAccountSetting(pool: selection.pool, account: selection.account, setting: selection.setting, enabled: selection.enabled)
+            await store.setAccountRole(pool: selection.pool, account: selection.account, role: selection.role)
             rebuildMenu()
         }
     }

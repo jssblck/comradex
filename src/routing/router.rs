@@ -763,8 +763,6 @@ impl Router {
                 }
             }
             if let Some(preferred_id) = configured
-                // Preservation filters this account out before preference is considered.
-                && preserved.as_ref() != Some(&preferred_id)
                 && preferred_id != selection.account_id
                 && selection.excluded_account.as_deref() != Some(preferred_id.as_str())
                 && pool.members.contains(&preferred_id)
@@ -2458,43 +2456,6 @@ mod tests {
                     .is_ok()
             );
         }
-    }
-
-    #[tokio::test]
-    async fn overlapping_preference_and_preservation_validate_and_fall_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
-        router
-            .set_account_order("default", Some("a".into()), Some("a".into()))
-            .await;
-        let selected = router.select("default", &pool, None, None).await.unwrap();
-        assert_eq!(selected.account_id, "b");
-        assert!(
-            router
-                .validate_selection(&selected, "default", &pool)
-                .await
-                .is_ok()
-        );
-        let fallback = router
-            .select("default", &pool, None, Some("b"))
-            .await
-            .unwrap();
-        assert_eq!(fallback.account_id, "a");
-        assert!(
-            router
-                .validate_selection(&fallback, "default", &pool)
-                .await
-                .is_ok()
-        );
-        router.quota_failure("b", &HeaderMap::new()).await;
-        let fallback = router.select("default", &pool, None, None).await.unwrap();
-        assert_eq!(fallback.account_id, "a");
-        assert!(
-            router
-                .validate_selection(&fallback, "default", &pool)
-                .await
-                .is_ok()
-        );
     }
 
     #[tokio::test]
