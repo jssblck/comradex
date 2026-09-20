@@ -927,10 +927,36 @@ impl App {
         }
     }
 
+    pub async fn run_usage_refresh(&self, requested: Arc<Notify>) {
+        let mut retry_delay = Duration::from_secs(5);
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let succeeded = self.refresh_managed_usage_at(now).await;
+            // A daemon can start before DNS/network service is ready. Failed checks
+            // must recover independently of inference traffic or the normal poll.
+            let delay = if succeeded {
+                retry_delay = Duration::from_secs(5);
+                Duration::from_secs(usage::REFRESH_INTERVAL_SECONDS)
+            } else {
+                let delay = retry_delay;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
+                delay
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {},
+                _ = requested.notified() => {},
+            }
+        }
+    }
+
     /// Fetch authoritative quota windows independently of inference traffic. A bounded amount of
     /// parallelism prevents one slow identity from delaying every other account while avoiding an
     /// unbounded burst for large configurations.
-    pub async fn refresh_managed_usage_at(&self, now: u64) {
+    /// Returns false if any usage fetch failed, so the scheduler can retry sooner.
+    pub async fn refresh_managed_usage_at(&self, now: u64) -> bool {
         let accounts = self
             .config
             .accounts
@@ -965,6 +991,7 @@ impl App {
 
         // Usage fetches remain concurrent; activation requests are sent one at a time.
         results.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut succeeded = true;
         for (account_id, result) in results {
             match result {
                 Ok((snapshot, credentials)) => {
@@ -983,13 +1010,15 @@ impl App {
                     }
                 }
                 Err(error) => {
+                    succeeded = false;
                     self.stats
                         .usage_fetch_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    warn!(account = account_id, %error, "managed account usage fetch failed");
+                    warn!(account = account_id, error = %format!("{error:#}"), "managed account usage fetch failed");
                 }
             }
         }
+        succeeded
     }
 
     async fn fetch_managed_usage_account(
@@ -8436,6 +8465,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_usage_scheduler_recovers_without_traffic_and_honors_manual_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("managed");
+        let now = chrono::Utc::now().timestamp() as u64;
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec(&serde_json::json!({"tokens": {
+                "access_token": crate::auth::tests::jwt(now + 3600, "usage"),
+                "refresh_token": "test-refresh-token",
+                "account_id": "workspace-a"
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (mut app, _, router) = managed_direct_test_app(dir.path(), &home);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        Arc::get_mut(&mut app).unwrap().usage_url =
+            format!("http://{address}/backend-api/wham/usage")
+                .parse()
+                .unwrap();
+        // Start with an unreachable upstream, as when the service starts before networking.
+        drop(listener);
+        let requested = Arc::new(Notify::new());
+        let worker_app = app.clone();
+        let worker_requested = requested.clone();
+        let worker = tokio::spawn(async move {
+            worker_app.run_usage_refresh(worker_requested).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.stats.usage_fetch_failures.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup fetch must be attempted without inference");
+        assert_eq!(
+            router.routing_snapshot().await.account_states["a"].usage_percent,
+            None
+        );
+
+        let listener = TcpListener::bind(address).await.unwrap();
+        let (_, server) = serve_usage_responses_on(listener, 2).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while app.stats.usage_fetch_successes.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed startup fetch must recover without inference or manual refresh");
+        assert_eq!(
+            router.routing_snapshot().await.account_states["a"].usage_percent,
+            Some(81)
+        );
+
+        // After success the next normal poll is five minutes away. A manual request wakes it.
+        requested.notify_one();
+        let requests = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("manual refresh must bypass the normal poll delay")
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("GET /backend-api/wham/usage "))
+        );
+        worker.abort();
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
     async fn managed_usage_fetches_each_account_and_isolates_failures() {
         use crate::auth::tests::jwt;
 
@@ -8648,6 +8750,13 @@ mod tests {
         expected_requests: usize,
     ) -> (Uri, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        serve_usage_responses_on(listener, expected_requests).await
+    }
+
+    async fn serve_usage_responses_on(
+        listener: TcpListener,
+        expected_requests: usize,
+    ) -> (Uri, tokio::task::JoinHandle<Vec<String>>) {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();

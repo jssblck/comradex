@@ -68,6 +68,7 @@ enum Request {
         secret: String,
     },
     UiStatus,
+    UiRefreshUsage,
     UiSetAccountRole {
         pool: String,
         account: String,
@@ -97,6 +98,7 @@ impl Request {
             | Self::SetPreserved { secret, .. }
             | Self::RoutingStatus { secret } => Some(secret),
             Self::UiStatus
+            | Self::UiRefreshUsage
             | Self::UiSetAccountRole { .. }
             | Self::UiSetPreferred { .. }
             | Self::UiStartLogin { .. }
@@ -543,6 +545,7 @@ impl Drop for SocketGuard {
 struct ConfigChanges {
     edit_lock: Mutex<()>,
     reload: Arc<Notify>,
+    usage_refresh: Arc<Notify>,
 }
 
 pub struct ControlServer {
@@ -590,6 +593,7 @@ impl ControlServer {
             changes: Arc::new(ConfigChanges {
                 edit_lock: Mutex::new(()),
                 reload: Arc::new(Notify::new()),
+                usage_refresh: Arc::new(Notify::new()),
             }),
             clients: Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS)),
         })
@@ -597,6 +601,10 @@ impl ControlServer {
 
     pub fn reload_requested(&self) -> Arc<Notify> {
         self.changes.reload.clone()
+    }
+
+    pub fn usage_refresh_requested(&self) -> Arc<Notify> {
+        self.changes.usage_refresh.clone()
     }
 
     pub async fn run(self) -> Result<()> {
@@ -694,6 +702,9 @@ async fn handle(
     } else {
         match serde_json::from_slice::<Request>(&bytes) {
             Ok(request) => {
+                if matches!(request, Request::UiRefreshUsage) {
+                    changes.usage_refresh.notify_one();
+                }
                 reload_after_response = matches!(request, Request::UiConnectExistingLogin { .. });
                 process(
                     request,
@@ -779,7 +790,7 @@ async fn process(
                 .await?;
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
             }
-            Request::UiStatus => {
+            Request::UiStatus | Request::UiRefreshUsage => {
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
             }
             Request::UiStartLogin { account } => {
@@ -1266,7 +1277,19 @@ kind = "inbound"
                 & 0o777,
             0o600
         );
+        let usage_refresh = server.usage_refresh_requested();
         let task = tokio::spawn(server.run());
+
+        let state = state_dir.clone();
+        let refreshed = tokio::task::spawn_blocking(move || {
+            send_raw(&state, serde_json::json!({"command": "ui_refresh_usage"}))
+        })
+        .await
+        .unwrap();
+        assert!(refreshed.ok);
+        tokio::time::timeout(Duration::from_secs(1), usage_refresh.notified())
+            .await
+            .expect("manual refresh must wake the usage scheduler");
 
         let state = state_dir.clone();
         let unauthorized = tokio::task::spawn_blocking(move || {

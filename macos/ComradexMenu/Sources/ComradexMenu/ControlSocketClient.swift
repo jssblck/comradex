@@ -3,6 +3,7 @@ import Foundation
 
 enum UIControlCommand: Equatable, Sendable {
     case status
+    case refreshUsage
     case setAccountRole(pool: String, account: String, role: AccountRole)
     case setPreferred(pool: String, account: String?)
     case startLogin(account: String)
@@ -14,6 +15,8 @@ enum UIControlCommand: Equatable, Sendable {
         switch self {
         case .status:
             object = ["command": "ui_status"]
+        case .refreshUsage:
+            object = ["command": "ui_refresh_usage"]
         case .setPreferred(let pool, let account):
             object = [
                 "command": "ui_set_preferred",
@@ -63,6 +66,7 @@ enum ControlSocketError: LocalizedError {
 
 protocol ControlServing: Sendable {
     func status() async throws -> UIStatusSnapshot
+    func refreshUsage() async throws
     func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot?
     func startLogin(account: String) async throws -> LoginSnapshot
@@ -91,6 +95,11 @@ final class ControlSocketClient: ControlServing, @unchecked Sendable {
     func status() async throws -> UIStatusSnapshot {
         let data = try await request(.status)
         return try Self.decode(UIStatusSnapshot.self, from: data, preferredKeys: ["status", "ui_status", "snapshot", "payload", "result"])
+    }
+
+    func refreshUsage() async throws {
+        let data = try await request(.refreshUsage)
+        _ = try Self.decode(UIStatusSnapshot.self, from: data, preferredKeys: ["status"])
     }
 
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? {

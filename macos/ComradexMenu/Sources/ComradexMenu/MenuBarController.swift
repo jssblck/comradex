@@ -23,6 +23,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var loginWindowController: NSWindowController?
     private var isMenuOpen = false
     private var hasDeferredMenuUpdate = false
+    private var usageRefreshPending = false
 
     var renderedMenu: NSMenu { menu }
 
@@ -244,22 +245,26 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         return item
     }
 
-    private func refreshStatus() {
+    private func refreshStatus(fetchUsage: Bool = false) {
+        usageRefreshPending = usageRefreshPending || fetchUsage
         guard refreshTask == nil else { return }
+        let requestUsage = usageRefreshPending
+        usageRefreshPending = false
         refreshTask = Task { [weak self] in
             guard let self else { return }
-            await store.refresh()
+            await store.refresh(fetchUsage: requestUsage)
             refreshTask = nil
             if isMenuOpen {
                 hasDeferredMenuUpdate = true
             } else {
                 rebuildMenu()
             }
+            if usageRefreshPending { refreshStatus() }
         }
     }
 
     @objc private func refreshSelected(_ sender: NSMenuItem) {
-        refreshStatus()
+        refreshStatus(fetchUsage: true)
     }
 
     @objc private func quitSelected(_ sender: NSMenuItem) {
