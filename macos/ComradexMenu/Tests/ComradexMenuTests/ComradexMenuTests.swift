@@ -355,6 +355,18 @@ final class ComradexMenuTests: XCTestCase {
     }
 
     @MainActor
+    func testRefreshMenuActionRequestsUsageFetch() async throws {
+        let requested = expectation(description: "usage fetch requested")
+        let store = ComradexStore(client: StubClient(onRefreshUsage: { requested.fulfill() }))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        let refresh = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "Refresh" })
+        let target = try XCTUnwrap(refresh.target as? NSObject)
+        target.perform(try XCTUnwrap(refresh.action), with: refresh)
+        await fulfillment(of: [requested], timeout: 2)
+    }
+
+    @MainActor
     func testRefreshFailurePreservesLastGoodStatus() async {
         let store = ComradexStore(client: FailingClient())
         let status = UIStatusSnapshot(daemonRunning: true)
@@ -710,6 +722,8 @@ final class ComradexMenuTests: XCTestCase {
 }
 
 private struct StubClient: ControlServing {
+    var onRefreshUsage: @Sendable () -> Void = {}
+    func refreshUsage() async throws { onRefreshUsage() }
     func status() async throws -> UIStatusSnapshot { UIStatusSnapshot() }
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
     func connectExistingLogin(account: String) async throws { throw ControlSocketError.daemon("unavailable") }
@@ -835,6 +849,7 @@ private struct SelectionWithoutStatusClient: ControlServing {
 }
 
 extension ControlServing {
+    func refreshUsage() async throws {}
     func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot {
         throw ControlSocketError.daemon("role change unavailable")
     }

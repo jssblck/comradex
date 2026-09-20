@@ -26,11 +26,19 @@ final class ComradexStore: ObservableObject {
 
     deinit { loginTask?.cancel() }
 
-    func refresh() async {
+    func refresh(fetchUsage: Bool = false) async {
         guard !isRefreshing, updatingPool == nil else { return }
         let generation = statusGeneration
         isRefreshing = true
         defer { isRefreshing = false }
+        if fetchUsage {
+            do {
+                try await client.refreshUsage()
+            } catch {
+                errorMessage = error.localizedDescription
+                return
+            }
+        }
         await readStatus(generation: generation)
     }
 

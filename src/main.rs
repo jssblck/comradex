@@ -380,6 +380,7 @@ async fn serve_once(path: &Path) -> Result<bool> {
         stats.clone(),
     )?;
     let reload = control_server.reload_requested();
+    let usage_refresh_requested = control_server.usage_refresh_requested();
     let mut control_task = tokio::spawn(control_server.run());
     info!(
         elapsed_ms = startup.elapsed().as_millis(),
@@ -431,18 +432,9 @@ async fn serve_once(path: &Path) -> Result<bool> {
     });
     let usage_refresh_app = app.clone();
     let usage_refresh_background = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(
-            comradex::usage::REFRESH_INTERVAL_SECONDS,
-        ));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            usage_refresh_app.refresh_managed_usage_at(now).await;
-        }
+        usage_refresh_app
+            .run_usage_refresh(usage_refresh_requested)
+            .await;
     });
     let mut reload_requested = false;
     let listener_error = tokio::select! {
