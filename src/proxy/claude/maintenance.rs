@@ -345,6 +345,44 @@ async fn run_native_warm_with(
 mod tests {
     use super::*;
     #[tokio::test]
+    #[ignore = "rotates a real managed Claude grant and spends subscription quota; explicitly authorize before running"]
+    async fn live_managed_claude_refresh_and_warming() {
+        let home = std::env::var_os("COMRADEX_LIVE_CLAUDE_HOME")
+            .expect("explicit managed Claude home required");
+        let home = Path::new(&home);
+        let before = auth::read(home).unwrap();
+        let config = Config {
+            proxy: Default::default(),
+            listeners: Default::default(),
+            pools: Default::default(),
+            accounts: std::collections::BTreeMap::from([(
+                "test".into(),
+                AccountConfig::ClaudeHome {
+                    path: home.to_owned(),
+                },
+            )]),
+        };
+        let refreshed = auth::Resolver::new(&config)
+            .resolve(home, Some(&before.access_token))
+            .await
+            .unwrap();
+        assert!(
+            refreshed.owner() == before.owner() && refreshed.device_id == before.device_id,
+            "refresh changed native identity"
+        );
+        assert!(
+            refreshed.expires_at > auth::now() + 60,
+            "refreshed credential is not usable"
+        );
+        let saved = auth::read(home).unwrap();
+        assert!(
+            saved.access_token == refreshed.access_token
+                && saved.refresh_token == refreshed.refresh_token,
+            "rotated grant was not persisted"
+        );
+        run_native_warm(&refreshed).await.unwrap();
+    }
+    #[tokio::test]
     async fn claude_warming_uses_an_isolated_native_invocation_without_a_refresh_grant() {
         let credential = auth::Credential {
             access_token: "sk-ant-oat01-synthetic".into(),

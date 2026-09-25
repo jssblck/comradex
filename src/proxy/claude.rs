@@ -952,6 +952,44 @@ kind="claude_inbound"
     }
 
     #[tokio::test]
+    async fn claude_partial_inference_usage_preserves_the_other_shared_window() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        assert!(harness.app.refresh_claude_usage_at(auth::now()).await);
+        let credential = auth::read(harness.app.config.accounts["ada"].home().unwrap()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.30".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            (auth::now() + 3600).to_string().parse().unwrap(),
+        );
+        harness
+            .app
+            .router
+            .observe_usage_snapshot_for_owner(
+                "ada",
+                quota::snapshot(&headers, auth::now()).unwrap(),
+                &credential.owner(),
+            )
+            .await;
+        let state = harness.app.router.routing_snapshot().await;
+        assert_eq!(
+            state.account_states["ada"].usage_windows["5h"].used_percent,
+            Some(30)
+        );
+        assert_eq!(
+            state.account_states["ada"]
+                .usage_windows
+                .get("7d")
+                .and_then(|w| w.used_percent),
+            Some(10)
+        );
+        harness.close().await;
+    }
+
+    #[tokio::test]
     async fn claude_prefer_preserve_changes_apply_to_new_work_and_keep_existing_sessions() {
         let harness = Harness::new(true, StatusCode::OK).await;
         let first = harness.send(request_body(), native_headers()).await;

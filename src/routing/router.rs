@@ -1155,19 +1155,31 @@ impl Router {
         }
     }
 
-    /// Replace the last observed usage view with an authoritative WHAM snapshot. This updates
+    /// Update the usage view from a management poll or native response headers. This updates
     /// fresh-work admission scores and status metadata without turning a reported 100% window
     /// into a hard quota cooldown before upstream actually rejects a request.
     pub async fn observe_usage_snapshot_for_owner(
         &self,
         account: &str,
-        snapshot: UsageSnapshot,
+        mut snapshot: UsageSnapshot,
         owner: &QuotaOwner,
     ) {
         let observed_evidence = usage_snapshot_evidence(&snapshot);
         if let Some(runtime) = self.accounts.lock().await.get_mut(account) {
             if !self.accepts_quota_owner(account, runtime, owner) {
                 return;
+            }
+            // Claude inference can report only one shared window. Its management poll
+            // reports both; a partial inference update must not erase the other one.
+            if snapshot.windows.contains_key("5h") || snapshot.windows.contains_key("7d") {
+                for name in ["5h", "7d"] {
+                    if let Some(window) = runtime.usage_windows.get(name) {
+                        snapshot
+                            .windows
+                            .entry(name.into())
+                            .or_insert_with(|| window.clone());
+                    }
+                }
             }
             runtime.usage = snapshot
                 .windows

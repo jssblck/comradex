@@ -76,7 +76,7 @@ The usage worker checks every five minutes, and the menubar's refresh action req
 
 The Claude listener accepts native subscription OAuth requests for Messages, token counting, model discovery, and the startup probe. It preserves prompts, tools, thinking, cache controls, beta headers, and response bytes. Managed routing changes only the selected OAuth bearer, account/device metadata, and an already-present supported request checksum. It does not translate foreign harnesses or manufacture Claude Code headers. The native request checks are compatibility checks, not cryptographic proof of the calling executable.
 
-Validation includes a synthetic capture from Claude Code 2.1.281 and local upstream tests. Real two-account subscription rollover and all IDE/helper surfaces have not been validated. Gateway TLS differs from a direct Claude Code connection, and neither this implementation nor CPA establishes a guarantee against account restrictions. See the [design and evidence](docs/claude-multiplexing-plan.md).
+Validation includes Claude Code 2.1.281 captures, local upstream tests, and live tests with two distinct subscription accounts: managed sign-in, credential substitution, new/resumed conversations, sticky routing after role changes and daemon restart, real OAuth refresh, and a native warming request. Quota-triggered cross-account rollover and reset scheduling are covered by controlled tests; a real quota rejection was not forced. All IDE/helper surfaces have not been validated. Gateway TLS differs from a direct Claude Code connection, and neither this implementation nor CPA establishes a guarantee against account restrictions. See the [design and evidence](docs/claude-multiplexing-plan.md).
 
 ## Installation
 
