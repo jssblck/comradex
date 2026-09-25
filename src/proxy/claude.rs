@@ -218,7 +218,9 @@ impl App {
         }
         let native = match wire::inspect(&parts.headers, &body, count) {
             Ok(native) => native,
-            Err(_) => {
+            Err(error) => {
+                // Check names only; the rejected request's headers and body are not logged.
+                tracing::warn!(%error, "rejected Claude request that failed native checks");
                 return Ok(error_response(
                     StatusCode::FORBIDDEN,
                     "native_claude_required",

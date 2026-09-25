@@ -105,7 +105,12 @@ pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<N
             "conflicting session identities"
         );
         session = body_session;
-        ensure!(uuid(&account), "native account UUID required");
+        // Claude Code sends an empty account UUID while it holds a token but no cached
+        // account profile, for example after a failed refresh and a later re-login.
+        ensure!(
+            account.is_empty() || uuid(&account),
+            "native account UUID required"
+        );
         ensure!(
             device.len() == 64 && device.bytes().all(|b| b.is_ascii_hexdigit()),
             "native device ID required"
@@ -521,6 +526,29 @@ mod tests {
             .replace(&"a".repeat(64), &"b".repeat(64));
         assert_eq!(edited, expected.as_bytes());
         assert!(!String::from_utf8(edited).unwrap().contains(" cch="));
+    }
+    #[test]
+    fn native_request_without_cached_account_profile_is_accepted_and_gains_identity() {
+        // Captured from Claude Code 2.1.281 (sdk-ts) holding an OAuth token without a
+        // cached account profile: it sends the key with an empty value.
+        let bytes = String::from_utf8(body())
+            .unwrap()
+            .replace(ACCOUNT, "")
+            .into_bytes();
+        let native = inspect(&headers(), &bytes, false).unwrap();
+        assert_eq!(
+            (native.account.as_str(), native.session.as_str()),
+            ("", SESSION)
+        );
+        let edited = rewrite(&bytes, ACCOUNT, &"a".repeat(64)).unwrap();
+        assert_eq!(edited, body());
+        for account in ["not-a-uuid", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa"] {
+            let bytes = String::from_utf8(body())
+                .unwrap()
+                .replace(ACCOUNT, account)
+                .into_bytes();
+            assert!(inspect(&headers(), &bytes, false).is_err(), "{account}");
+        }
     }
     #[test]
     fn signed_and_server_owned_context_is_not_replayed_cross_account() {
