@@ -100,6 +100,9 @@ pub struct ProxyConfig {
     /// Start freshly reset weekly windows with a minimal account-specific request.
     #[serde(default)]
     pub auto_activate_weekly_usage: bool,
+    /// Warm elapsed Claude 5-hour/7-day windows through genuine Claude Code.
+    #[serde(default)]
+    pub auto_activate_claude_usage: bool,
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
     #[serde(default)]
@@ -126,6 +129,7 @@ impl Default for ProxyConfig {
             affinity_idle_days: default_affinity_days(),
             snapshot_interval_seconds: default_flush_seconds(),
             auto_activate_weekly_usage: false,
+            auto_activate_claude_usage: false,
             state_dir: None,
             installation_secret: String::new(),
             affinity_key: String::new(),

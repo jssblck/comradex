@@ -928,6 +928,7 @@ impl App {
                 }
             }
         }
+        self.refresh_claude_credentials_at(now).await;
     }
 
     pub async fn run_usage_refresh(&self, requested: Arc<Notify>) {
@@ -1021,7 +1022,7 @@ impl App {
                 }
             }
         }
-        succeeded
+        self.refresh_claude_usage_at(now).await && succeeded
     }
 
     async fn fetch_managed_usage_account(

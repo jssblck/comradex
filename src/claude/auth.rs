@@ -94,6 +94,16 @@ pub struct Resolver {
 }
 
 impl Resolver {
+    #[cfg(test)]
+    pub(crate) fn use_test_endpoint(&mut self, url: &str) {
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        self.client = Client::builder(TokioExecutor::new()).build(connector);
+        self.token_url = url.parse().unwrap();
+    }
     pub fn new(config: &Config) -> Self {
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -145,6 +155,14 @@ impl Resolver {
                 *until == u64::MAX && *fingerprint == blake3::hash(current.refresh_token.as_bytes())
             })
     }
+    pub(crate) async fn require_login(&self, home: &Path) {
+        if let Ok(current) = read(home) {
+            self.failures.lock().await.insert(
+                home.to_owned(),
+                (blake3::hash(current.refresh_token.as_bytes()), u64::MAX),
+            );
+        }
+    }
     async fn resolve_inner(&self, home: &Path, rejected: Option<&str>) -> Result<Credential> {
         let lock = self
             .locks
@@ -153,15 +171,15 @@ impl Resolver {
         let _lock = lock.lock().await;
         let _file_lock = HomeAuthLock::acquire_async(home).await?;
         let mut current = read(home)?;
-        if current.expires_at > now() + 60 && rejected != Some(current.access_token.as_str()) {
-            return Ok(current);
-        }
         let fingerprint = blake3::hash(current.refresh_token.as_bytes());
         if let Some((old, until)) = self.failures.lock().await.get(home) {
             ensure!(
                 *old != fingerprint || *until <= now(),
                 "Claude refresh unavailable; wait or log in again"
             );
+        }
+        if current.expires_at > now() + 60 && rejected != Some(current.access_token.as_str()) {
+            return Ok(current);
         }
         ensure!(
             !current.refresh_token.is_empty(),
@@ -238,20 +256,55 @@ impl Resolver {
 pub fn login(home: &Path) -> Result<()> {
     fs::create_dir_all(home)?;
     let _guard = HomeAuthLock::acquire(home)?;
-    let native = home.join("native-login");
-    fs::create_dir_all(&native)?;
-    let native = fs::canonicalize(native)?;
-    let mut command = Command::new("claude");
-    command
-        .args(["auth", "login"])
-        .current_dir(&native)
-        .env("CLAUDE_CONFIG_DIR", &native)
-        .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &native);
+    ensure!(
+        login_command(home)?
+            .status()
+            .context("launch official Claude login")?
+            .success(),
+        "Claude login did not complete"
+    );
+    complete_login(home)
+}
+
+pub(crate) fn executable() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CLAUDE_EXECUTABLE") {
+        let path = PathBuf::from(path);
+        ensure!(
+            path.is_absolute() && path.is_file(),
+            "CLAUDE_EXECUTABLE must name an absolute executable path"
+        );
+        return Ok(path);
+    }
+    let mut paths = std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .map(|p| p.join("claude"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".local/bin/claude"));
+    }
+    paths.extend([
+        PathBuf::from("/opt/homebrew/bin/claude"),
+        PathBuf::from("/usr/local/bin/claude"),
+    ]);
+    paths
+        .into_iter()
+        .find(|p| p.is_file())
+        .context("Claude Code is not installed; set CLAUDE_EXECUTABLE")
+}
+
+pub(crate) fn clean_command() -> Result<Command> {
+    let mut command = Command::new(executable()?);
     for key in [
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_CUSTOM_HEADERS",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
         "ANTHROPIC_PROFILE",
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_USE_VERTEX",
@@ -259,13 +312,24 @@ pub fn login(home: &Path) -> Result<()> {
     ] {
         command.env_remove(key);
     }
-    ensure!(
-        command
-            .status()
-            .context("launch official Claude login")?
-            .success(),
-        "Claude login did not complete"
-    );
+    Ok(command)
+}
+
+pub(crate) fn login_command(home: &Path) -> Result<Command> {
+    let native = home.join("native-login");
+    fs::create_dir_all(&native)?;
+    let native = fs::canonicalize(native)?;
+    let mut command = clean_command()?;
+    command
+        .args(["auth", "login"])
+        .current_dir(&native)
+        .env("CLAUDE_CONFIG_DIR", &native)
+        .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &native);
+    Ok(command)
+}
+
+pub(crate) fn complete_login(home: &Path) -> Result<()> {
+    let native = fs::canonicalize(home.join("native-login"))?;
     let credential_bytes = read_native_credentials(&native)?;
     let settings =
         fs::read(native.join(".claude.json")).context("native login metadata unavailable")?;

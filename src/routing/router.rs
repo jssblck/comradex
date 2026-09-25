@@ -1002,6 +1002,33 @@ impl Router {
             runtime.quota_reset_at = Some(at);
         }
     }
+
+    pub(crate) async fn observe_claude_usage_for_owner(
+        &self,
+        account: &str,
+        snapshot: UsageSnapshot,
+        owner: &QuotaOwner,
+    ) {
+        let now = crate::claude::auth::now();
+        let reset = snapshot
+            .windows
+            .values()
+            .filter(|w| w.used_percent == Some(100))
+            .filter_map(|w| w.reset_at_unix)
+            .filter(|at| *at > now as i64)
+            .max();
+        self.observe_usage_snapshot_for_owner(account, snapshot, owner)
+            .await;
+        if let Some(reset) = reset {
+            self.claude_quota_until(account, reset as u64, owner).await;
+        } else if let Some(runtime) = self.accounts.lock().await.get_mut(account)
+            && self.accepts_quota_owner(account, runtime, owner)
+        {
+            runtime.quota_until = None;
+            runtime.quota_reset_at = None;
+            runtime.quota_evidence = None;
+        }
+    }
     pub async fn capacity_failure(&self, account: &str) {
         if let Some(runtime) = self.accounts.lock().await.get_mut(account)
             && let Some(delay) = runtime.capacity.record(Instant::now())

@@ -3,6 +3,16 @@ import XCTest
 @testable import ComradexMenu
 
 final class ComradexMenuTests: XCTestCase {
+    func testClaudeBrowserLoginUsesOnlyItsOwnAuthorizationOrigin() throws {
+        let good = LoginSnapshot(account: "grace", provider: "claude", state: .running, verificationURI: "https://claude.ai/oauth/authorize?state=synthetic")
+        XCTAssertEqual(good.safeVerificationURL.host, "claude.ai")
+        XCTAssertEqual(good.safeVerificationURL.path, "/oauth/authorize")
+        XCTAssertEqual(good.statusLabel, "Complete sign-in in your browser")
+        for address in ["https://evil.example/oauth/authorize", "https://claude.ai.evil.example/oauth/authorize", "https://claude.ai@evil.example/oauth/authorize", "http://claude.ai/oauth/authorize", "https://claude.ai/other"] {
+            let invalid = LoginSnapshot(account: "grace", provider: "claude", state: .running, verificationURI: address)
+            XCTAssertEqual(invalid.safeVerificationURL.absoluteString, "https://claude.ai/login")
+        }
+    }
     @MainActor
     @available(macOS 14.4, *)
     func testClaudeAccountsNeverOfferCodexLoginActions() throws {
@@ -17,9 +27,9 @@ final class ComradexMenuTests: XCTestCase {
         let controller = MenuBarController(store: store)
         controller.rebuildMenu()
         let grace = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("grace ·") })
-        let login = try XCTUnwrap(grace.submenu?.items.first { $0.title.contains("comradex account login grace") })
-        XCTAssertFalse(login.isEnabled)
-        XCTAssertNil(login.action)
+        let login = try XCTUnwrap(grace.submenu?.items.first { $0.title == "Sign In…" })
+        XCTAssertTrue(login.isEnabled)
+        XCTAssertEqual(login.action.map(NSStringFromSelector), "reloginSelected:")
         let ada = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("ada ·") })
         XCTAssertFalse(ada.submenu?.items.contains { $0.title.contains("Connect existing Codex") } ?? true)
     }

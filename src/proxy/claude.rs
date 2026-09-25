@@ -25,11 +25,15 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
+mod maintenance;
 
 pub(super) struct Claude {
     auth: auth::Resolver,
     client: HttpClient,
     upstream: String,
+    usage_url: String,
+    usage_backoff: Mutex<HashMap<String, u64>>,
+    activation: Mutex<Result<crate::claude::maintenance::ActivationLedger>>,
     sessions: Mutex<HashMap<String, Weak<Session>>>,
 }
 #[derive(Default)]
@@ -46,6 +50,16 @@ impl Claude {
             auth: auth::Resolver::new(config),
             client,
             upstream: crate::claude::UPSTREAM.into(),
+            usage_url: format!("{}/api/oauth/usage", crate::claude::UPSTREAM),
+            usage_backoff: Mutex::new(HashMap::new()),
+            activation: Mutex::new(crate::claude::maintenance::ActivationLedger::open(
+                config
+                    .proxy
+                    .state_dir
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("claude-activation.json"),
+            )),
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -392,6 +406,7 @@ impl App {
                         )
                         .await?;
                     if response.status() == StatusCode::UNAUTHORIZED {
+                        self.claude.auth.require_login(home).await;
                         self.router.reauth_required(&account).await;
                     }
                 } else if self.claude.auth.needs_login(home).await {
@@ -633,12 +648,38 @@ mod tests {
                                 let hold = parts.headers.contains_key("x-test-hold");
                                 let reject = parts.headers.contains_key("x-test-quota");
                                 let ambiguous = parts.headers.contains_key("x-test-ambiguous");
+                                let usage = parts.uri.path() == "/api/oauth/usage";
+                                let token = parts.uri.path() == "/token";
                                 seen.lock().await.push((
                                     parts.headers,
                                     body,
                                     parts.uri.to_string(),
                                 ));
-                                let response = if ambiguous {
+                                let response = if token {
+                                    Response::builder().body(Full::new(Bytes::from_static(br#"{"access_token":"sk-ant-oat01-refreshed","refresh_token":"synthetic-rotated","expires_in":3600}"#)).boxed()).unwrap()
+                                } else if usage {
+                                    let reset = chrono::DateTime::from_timestamp(
+                                        (auth::now() + 3600) as i64,
+                                        0,
+                                    )
+                                    .unwrap()
+                                    .to_rfc3339();
+                                    let data = json!({"five_hour":{"utilization":if first {100}else{25},"resets_at":reset},"seven_day":{"utilization":10,"resets_at":reset}});
+                                    Response::builder()
+                                        .status(if status == StatusCode::TOO_MANY_REQUESTS {
+                                            status
+                                        } else {
+                                            StatusCode::OK
+                                        })
+                                        .header("retry-after", "3600")
+                                        .body(
+                                            Full::new(Bytes::from(
+                                                serde_json::to_vec(&data).unwrap(),
+                                            ))
+                                            .boxed(),
+                                        )
+                                        .unwrap()
+                                } else if ambiguous {
                                     Response::builder()
                                         .status(StatusCode::TOO_MANY_REQUESTS)
                                         .header("retry-after", "10")
@@ -741,6 +782,13 @@ kind="claude_inbound"
             let listener = config.listeners["claude"].clone();
             let mut app =
                 App::new_unvalidated(Arc::new(config), router, Arc::new(Stats::default())).unwrap();
+            Arc::get_mut(&mut app).unwrap().claude.usage_url =
+                format!("{upstream_url}/api/oauth/usage");
+            Arc::get_mut(&mut app)
+                .unwrap()
+                .claude
+                .auth
+                .use_test_endpoint(&format!("{upstream_url}/token"));
             Arc::get_mut(&mut app).unwrap().claude.upstream = upstream_url;
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/claude-test-secret", tcp.local_addr().unwrap());
@@ -826,6 +874,117 @@ kind="claude_inbound"
             StatusCode::FORBIDDEN
         );
         assert!(harness.seen.lock().await.is_empty());
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn claude_background_usage_skips_limited_preferred_account_before_inference() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        assert!(harness.app.refresh_claude_usage_at(auth::now()).await);
+        let status = harness.app.router.routing_snapshot().await;
+        assert!(!status.account_states["grace"].available);
+        assert_eq!(status.account_states["grace"].usage_percent, Some(100));
+        assert_eq!(status.account_states["ada"].usage_percent, Some(25));
+        let response = harness.send(request_body(), native_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        let seen = harness.seen.lock().await;
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[2].0["authorization"], "Bearer sk-ant-oat01-ada");
+        assert!(
+            seen[..2]
+                .iter()
+                .all(|r| r.0["user-agent"].as_bytes().starts_with(b"comradex/"))
+        );
+        drop(seen);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn claude_background_refresh_and_foreground_share_one_rotating_grant() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let path = harness.app.config.accounts["grace"]
+            .home()
+            .unwrap()
+            .join("claude-auth.json");
+        let mut credential: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        credential["expires_at"] = (auth::now() - 1).into();
+        std::fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
+        let (_, response) = tokio::join!(
+            harness.app.refresh_managed_accounts_at(auth::now()),
+            harness.send(request_body(), native_headers())
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        let updated = auth::read(path.parent().unwrap()).unwrap();
+        assert_eq!(updated.refresh_token, "synthetic-rotated");
+        assert_eq!(updated.account_uuid, ACCOUNT);
+        assert_eq!(
+            harness
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r.2 == "/token")
+                .count(),
+            1
+        );
+        assert_eq!(
+            harness
+                .app
+                .stats
+                .refresh_accounts_checked
+                .load(Ordering::Relaxed),
+            2
+        );
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn claude_usage_rate_limit_does_not_spin_or_poison_inference_quota() {
+        let harness = Harness::new(true, StatusCode::TOO_MANY_REQUESTS).await;
+        assert!(!harness.app.refresh_claude_usage_at(auth::now()).await);
+        assert!(harness.app.refresh_claude_usage_at(auth::now() + 1).await);
+        assert_eq!(harness.seen.lock().await.len(), 2);
+        assert!(harness.app.router.routing_snapshot().await.account_states["grace"].available);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn claude_prefer_preserve_changes_apply_to_new_work_and_keep_existing_sessions() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let first = harness.send(request_body(), native_headers()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = first.bytes().await;
+        harness
+            .app
+            .router
+            .set_preferred("claude", Some("ada".into()))
+            .await;
+        harness
+            .app
+            .router
+            .set_preserved("claude", Some("grace".into()))
+            .await;
+        let same = harness.send(request_body(), native_headers()).await;
+        assert_eq!(same.status(), StatusCode::OK);
+        let _ = same.bytes().await;
+        let fresh_session = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let fresh = String::from_utf8(request_body())
+            .unwrap()
+            .replace(SESSION, fresh_session)
+            .into_bytes();
+        let mut headers = native_headers();
+        headers.insert("x-claude-code-session-id", fresh_session.parse().unwrap());
+        let response = harness.send(fresh, headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        let seen = harness.seen.lock().await;
+        assert_eq!(seen[0].0["authorization"], "Bearer sk-ant-oat01-grace");
+        assert_eq!(seen[1].0["authorization"], seen[0].0["authorization"]);
+        assert_eq!(seen[2].0["authorization"], "Bearer sk-ant-oat01-ada");
+        drop(seen);
         harness.close().await;
     }
     #[tokio::test]

@@ -54,7 +54,7 @@ The first add creates the `claude` pool and its listener at `127.0.0.1:10101`. C
 
 Installation sets only `env.ANTHROPIC_BASE_URL` in Claude Code's `settings.json`, using the listener's secret URL. Use `--claude-settings <path>` for another settings file. Keep Claude Code's ordinary subscription login active; do not configure a placeholder API key or auth token. `comradex uninstall` restores both Claude and Codex gateway settings while preserving unrelated settings. It refuses to overwrite a gateway URL changed after installation.
 
-Each managed Claude account uses an isolated native login profile, then imports its OAuth grant and real account/device identity into a private Comradex credential file. Comradex owns subsequent refreshes. Do not run Claude Code in these `accounts/<name>/native-login` directories: that would create a second refresh owner. Reauthenticate with `comradex account login <name>`. The menubar displays Claude accounts and observed quota; Claude login currently uses the CLI. `account connect` remains specific to existing Codex logins.
+Each managed Claude account uses an isolated native login profile, then imports its OAuth grant and real account/device identity into a private Comradex credential file. Comradex owns subsequent refreshes, including background renewal before expiry. Do not run Claude Code in these `accounts/<name>/native-login` directories: that would create a second refresh owner. Reauthenticate with **Sign In...** in the menubar or `comradex account login <name>`. The menubar launches official Claude Code browser authentication, tracks completion, and refreshes usage after sign-in. Set `CLAUDE_EXECUTABLE` to an absolute executable path if Claude Code is installed outside the usual locations. `account connect` remains specific to existing Codex logins.
 
 New sessions use the existing prefer/preserve policy:
 
@@ -63,7 +63,16 @@ comradex account prefer grace --pool claude
 comradex account preserve ada --pool claude
 ```
 
-Healthy sessions stay with their selected account. An explicit shared 5-hour or 7-day quota rejection can move an eligible request to another account before forwarding its response. Signed thinking, compaction, predecessor references, files, and containers keep their owner; an overlapping stream also prevents migration. These cases wait for their account or return an error. Permission errors, ambiguous limits, and interrupted streams never trigger cross-account replay. Unknown usage stays unknown until native response headers provide it; Claude accounts receive no background inference probes.
+Healthy sessions stay with their selected account. An explicit shared 5-hour or 7-day quota rejection can move an eligible request to another account before forwarding its response. Signed thinking, compaction, predecessor references, files, and containers keep their owner; an overlapping stream also prevents migration. These cases wait for their account or return an error. Permission errors, ambiguous limits, and interrupted streams never trigger cross-account replay. Background usage polling shows shared 5-hour and 7-day allowance in the menubar and excludes accounts with a confirmed active limit before sending inference. The usage endpoint's own throttling does not mark an account as inference-limited.
+
+To warm reset Claude windows, enable this separately from Codex's weekly warming:
+
+```toml
+[proxy]
+auto_activate_claude_usage = true
+```
+
+The usage worker checks every five minutes, and the menubar's refresh action requests an earlier check. Eligible elapsed or newly full 5-hour/7-day windows are warmed by running the installed Claude Code once with a tiny prompt, Haiku, no tools, and an isolated temporary profile. The native executable constructs the entire request and talks directly to Anthropic using that account's access token; it receives no refresh grant. Warming never rotates to another account. It skips active limits, concurrent account traffic, and windows already started by foreground use. Attempts and successful cycles survive daemon restarts; uncertain attempts back off for an hour. Warming is off by default and consumes a small amount of subscription quota when enabled. Ordinary background usage and authentication checks do not send model prompts.
 
 The Claude listener accepts native subscription OAuth requests for Messages, token counting, model discovery, and the startup probe. It preserves prompts, tools, thinking, cache controls, beta headers, and response bytes. Managed routing changes only the selected OAuth bearer, account/device metadata, and an already-present supported request checksum. It does not translate foreign harnesses or manufacture Claude Code headers. The native request checks are compatibility checks, not cryptographic proof of the calling executable.
 

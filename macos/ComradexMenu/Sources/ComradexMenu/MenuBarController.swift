@@ -195,12 +195,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 submenu.addItem(choice)
             }
         }
-        if loginAction && account.isClaude {
-            if !submenu.items.isEmpty { submenu.addItem(.separator()) }
-            let hint = NSMenuItem(title: "Sign in with comradex account login \(account.name)", action: nil, keyEquivalent: "")
-            hint.isEnabled = false
-            submenu.addItem(hint)
-        } else if loginAction {
+        if loginAction {
             if !submenu.items.isEmpty { submenu.addItem(.separator()) }
             let login = actionItem(
                 title: hasRunningLogin ? "Continue Sign In…" : "Sign In…",
