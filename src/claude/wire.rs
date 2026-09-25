@@ -38,14 +38,29 @@ pub fn native_headers(headers: &HeaderMap) -> bool {
     let Some(rest) = ua.strip_prefix("claude-cli/") else {
         return false;
     };
-    let version = rest.split(' ').next().unwrap_or("");
+    let Some((version, profile)) = rest.split_once(" (") else {
+        return false;
+    };
+    let Some(profile) = profile.strip_suffix(')') else {
+        return false;
+    };
+    // The native Agent SDK adds fields after the entry point, for example
+    // `(external, sdk-ts, agent-sdk/0.3.276)`. Match the field, not the suffix.
+    let mut fields = profile.split(", ");
+    let Some(_environment) = fields.next().filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    let Some(entrypoint) = fields.next() else {
+        return false;
+    };
     version.split('.').count() == 3
         && version
             .split('.')
             .all(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-        && ["cli", "sdk-cli", "claude-vscode"]
-            .iter()
-            .any(|entry| ua.contains(&format!(", {entry})")))
+        && matches!(
+            entrypoint,
+            "cli" | "sdk-cli" | "sdk-ts" | "sdk-py" | "claude-vscode"
+        )
 }
 
 pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<NativeRequest> {
@@ -414,6 +429,32 @@ fn normalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_user_agent_recognizes_sdk_entrypoints_and_optional_attribution_fields() {
+        let mut headers = headers();
+        for ua in [
+            "claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.3.276)",
+            "claude-cli/2.1.281 (external, sdk-py, agent-sdk/0.1.0)",
+            "claude-cli/2.1.281 (external, sdk-cli)",
+            "claude-cli/2.1.281 (external, cli, client-app/example)",
+            "claude-cli/2.1.281 (external, claude-vscode)",
+        ] {
+            headers.insert("user-agent", ua.parse().unwrap());
+            assert!(native_headers(&headers), "{ua}");
+            assert!(inspect(&headers, &body(), false).is_ok(), "{ua}");
+        }
+        for ua in [
+            "claude-cli/2.1.281 (external, foreign, sdk-cli)",
+            "claude-cli/2.1.281 (external, sdk-ts-foreign, agent-sdk/0.3.276)",
+            "claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.3.276",
+            "claude-cli/2.1 (external, sdk-ts)",
+            "claude-cli/2.1.281 (external)",
+            "anthropic-typescript/0.3.276 (external, sdk-ts)",
+        ] {
+            headers.insert("user-agent", ua.parse().unwrap());
+            assert!(!native_headers(&headers), "{ua}");
+        }
+    }
     pub const ACCOUNT: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     pub const SESSION: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     pub fn headers() -> HeaderMap {

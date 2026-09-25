@@ -8,6 +8,8 @@ CLIProxyAPI (CPA) is a useful implementation reference, particularly its distinc
 
 The implementation accepts genuine Claude Code request shapes and subscription OAuth. It does not implement CPA's foreign-harness cloaking, prompt injection, tool renaming, beta reconstruction, or synthetic device identities. Request-shape validation cannot cryptographically attest the caller.
 
+Native Agent SDK invocations use distinct entry points. For example, Claude Code launched by T3 through the TypeScript SDK sends `claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.3.276)`. The compatibility check parses the entry-point field rather than requiring it to end the User-Agent. Native SDK version and client attribution stay unchanged. A synthetic request captured from the native binary in this mode and a relay regression verify acceptance and byte-preserving forwarding.
+
 ## Implemented behavior and validation limits
 
 - Separate `claude_home` and `claude_inbound` accounts, homogeneous pools, loopback listeners, and an independent HTTP handler. Codex context and WebSocket handling remain separate.

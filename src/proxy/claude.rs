@@ -878,6 +878,27 @@ kind="claude_inbound"
     }
 
     #[tokio::test]
+    async fn native_typescript_sdk_request_keeps_its_original_attribution() {
+        let harness = Harness::new(false, StatusCode::OK).await;
+        let ua = "claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.3.276)";
+        let mut headers = native_headers();
+        headers.insert("user-agent", ua.parse().unwrap());
+        let body = String::from_utf8(request_body())
+            .unwrap()
+            .replace("cc_entrypoint=sdk-cli;", "cc_entrypoint=sdk-ts;")
+            .into_bytes();
+        let response = harness.send(body.clone(), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), STREAM);
+        let seen = harness.seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0["user-agent"], ua);
+        assert_eq!(seen[0].1, body);
+        drop(seen);
+        harness.close().await;
+    }
+
+    #[tokio::test]
     async fn claude_background_usage_skips_limited_preferred_account_before_inference() {
         let harness = Harness::new(true, StatusCode::OK).await;
         assert!(harness.app.refresh_claude_usage_at(auth::now()).await);
