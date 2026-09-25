@@ -62,6 +62,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     let usageWindows: [String: UsageWindowSnapshot]
 
     var id: String { name }
+    var isClaude: Bool { kind.lowercased().hasPrefix("claude_") }
     var isSignedIn: Bool {
         signedIn ?? ["signed_in", "authenticated", "ready"].contains(authState?.lowercased())
     }

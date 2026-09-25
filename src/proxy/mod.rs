@@ -3,6 +3,7 @@ mod accepted_retry;
 mod accepted_retry_tests;
 #[cfg(test)]
 mod account_pin_tests;
+mod claude;
 #[cfg(test)]
 mod compression_tests;
 mod context;
@@ -781,6 +782,7 @@ impl Drop for DirectAccountLease {
 }
 
 pub struct App {
+    claude: claude::Claude,
     config: Arc<Config>,
     router: Arc<Router>,
     client: HttpClient,
@@ -835,6 +837,7 @@ impl App {
         let mut auth = auth::Resolver::new(&config);
         auth.health = router.auth_health.clone();
         Ok(Arc::new(Self {
+            claude: claude::Claude::new(&config)?,
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             bridge_turn_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             upgrade_slots: Arc::new(Semaphore::new(config.proxy.max_upgrades)),
@@ -1181,6 +1184,16 @@ impl App {
     ) -> Result<Response<ProxyBody>, Infallible> {
         let response = if self.service_health_path(req.uri()) {
             self.health_response()
+        } else if self.config.is_claude_pool(&listener.pool) {
+            self.handle_claude(req, &listener)
+                .await
+                .unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "claude_proxy_error",
+                        "Claude request could not be completed; check account status",
+                    )
+                })
         } else {
             match self.authorized_path(req.uri()) {
                 None => error_response(StatusCode::NOT_FOUND, "not_found", "unknown proxy path"),

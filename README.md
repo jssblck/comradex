@@ -2,7 +2,7 @@
 
 > Workers of all accounts, unite.
 
-Comradex is a small Rust relay that gives the native Codex App/CLI a sticky, quota-aware collective of ChatGPT accounts.
+Comradex is a small Rust relay that gives native Codex and Claude Code sticky, quota-aware account pools.
 
 ## Quick start
 
@@ -39,6 +39,35 @@ comradex account add personal_2
 ```
 
 The command updates the configuration, restarts the daemon if it is installed as a service, and walks through device login. See [Accounts](#accounts) for the manual setup and credential details.
+
+## Claude Code
+
+Claude support uses a separate pool and loopback listener. Add accounts through official Claude Code login:
+
+```sh
+comradex account add grace --claude --pool claude
+comradex account add ada --claude --pool claude
+comradex install --listener claude
+```
+
+The first add creates the `claude` pool and its listener at `127.0.0.1:10101`. Change that address in `comradex.toml` if needed. A running macOS service reloads automatically after adding accounts; restart a manually launched daemon yourself. Restart Claude Code after installation.
+
+Installation sets only `env.ANTHROPIC_BASE_URL` in Claude Code's `settings.json`, using the listener's secret URL. Use `--claude-settings <path>` for another settings file. Keep Claude Code's ordinary subscription login active; do not configure a placeholder API key or auth token. `comradex uninstall` restores both Claude and Codex gateway settings while preserving unrelated settings. It refuses to overwrite a gateway URL changed after installation.
+
+Each managed Claude account uses an isolated native login profile, then imports its OAuth grant and real account/device identity into a private Comradex credential file. Comradex owns subsequent refreshes. Do not run Claude Code in these `accounts/<name>/native-login` directories: that would create a second refresh owner. Reauthenticate with `comradex account login <name>`. The menubar displays Claude accounts and observed quota; Claude login currently uses the CLI. `account connect` remains specific to existing Codex logins.
+
+New sessions use the existing prefer/preserve policy:
+
+```sh
+comradex account prefer grace --pool claude
+comradex account preserve ada --pool claude
+```
+
+Healthy sessions stay with their selected account. An explicit shared 5-hour or 7-day quota rejection can move an eligible request to another account before forwarding its response. Signed thinking, compaction, predecessor references, files, and containers keep their owner; an overlapping stream also prevents migration. These cases wait for their account or return an error. Permission errors, ambiguous limits, and interrupted streams never trigger cross-account replay. Unknown usage stays unknown until native response headers provide it; Claude accounts receive no background inference probes.
+
+The Claude listener accepts native subscription OAuth requests for Messages, token counting, model discovery, and the startup probe. It preserves prompts, tools, thinking, cache controls, beta headers, and response bytes. Managed routing changes only the selected OAuth bearer, account/device metadata, and an already-present supported request checksum. It does not translate foreign harnesses or manufacture Claude Code headers. The native request checks are compatibility checks, not cryptographic proof of the calling executable.
+
+Validation includes a synthetic capture from Claude Code 2.1.281 and local upstream tests. Real two-account subscription rollover and all IDE/helper surfaces have not been validated. Gateway TLS differs from a direct Claude Code connection, and neither this implementation nor CPA establishes a guarantee against account restrictions. See the [design and evidence](docs/claude-multiplexing-plan.md).
 
 ## Installation
 

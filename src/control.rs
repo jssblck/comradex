@@ -154,6 +154,8 @@ pub struct UiAccountStatus {
 pub enum UiAccountKind {
     Inbound,
     CodexHome,
+    ClaudeHome,
+    ClaudeInbound,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -987,6 +989,24 @@ async fn build_ui_status(
                 .map(|(pool_name, _)| pool_name.clone())
                 .collect();
             let (kind, signed_in, auth_state) = match account {
+                crate::config::AccountConfig::ClaudeInbound => (
+                    UiAccountKind::ClaudeInbound,
+                    true,
+                    UiAccountAuthState::Inbound,
+                ),
+                crate::config::AccountConfig::ClaudeHome { path } => {
+                    let ready = crate::claude::auth::read(path).is_ok()
+                        && !accounts_needing_login.contains(name);
+                    (
+                        UiAccountKind::ClaudeHome,
+                        ready,
+                        if ready {
+                            UiAccountAuthState::SignedIn
+                        } else {
+                            UiAccountAuthState::SignedOut
+                        },
+                    )
+                }
                 crate::config::AccountConfig::Inbound => {
                     (UiAccountKind::Inbound, true, UiAccountAuthState::Inbound)
                 }
@@ -1086,6 +1106,10 @@ fn managed_account_home<'a>(config: &'a Config, account: &str) -> Result<&'a Pat
         .get(account)
         .with_context(|| format!("unknown account {account}"))?
     {
+        crate::config::AccountConfig::ClaudeHome { .. }
+        | crate::config::AccountConfig::ClaudeInbound => {
+            bail!("use `comradex account login` for Claude accounts")
+        }
         crate::config::AccountConfig::Inbound => {
             bail!(
                 "this account uses the requesting client's login; connect an existing Codex login first"

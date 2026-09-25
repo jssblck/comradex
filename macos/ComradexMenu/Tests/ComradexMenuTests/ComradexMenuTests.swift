@@ -3,6 +3,27 @@ import XCTest
 @testable import ComradexMenu
 
 final class ComradexMenuTests: XCTestCase {
+    @MainActor
+    @available(macOS 14.4, *)
+    func testClaudeAccountsNeverOfferCodexLoginActions() throws {
+        let managed = try decodeAccount(#"{"name":"grace","kind":"claude_home","signed_in":false,"auth_state":"signed_out","pools":["claude"]}"#)
+        let inbound = try decodeAccount(#"{"name":"ada","kind":"claude_inbound","signed_in":true,"auth_state":"inbound","pools":["claude"]}"#)
+        XCTAssertTrue(managed.isClaude)
+        XCTAssertTrue(inbound.isClaude)
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(accounts: [managed, inbound], pools: [
+            PoolSnapshot(name: "claude", members: ["grace", "ada"], preferred: nil, active: nil)
+        ]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        let grace = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("grace ·") })
+        let login = try XCTUnwrap(grace.submenu?.items.first { $0.title.contains("comradex account login grace") })
+        XCTAssertFalse(login.isEnabled)
+        XCTAssertNil(login.action)
+        let ada = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("ada ·") })
+        XCTAssertFalse(ada.submenu?.items.contains { $0.title.contains("Connect existing Codex") } ?? true)
+    }
+
     func testStatusIconIsAValidTemplateImage() {
         XCTAssertTrue(StatusIcon.image.isValid)
         XCTAssertTrue(StatusIcon.image.isTemplate)
