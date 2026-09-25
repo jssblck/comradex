@@ -56,6 +56,8 @@ Installation sets only `env.ANTHROPIC_BASE_URL` in Claude Code's `settings.json`
 
 Each managed Claude account uses an isolated native login profile, then imports its OAuth grant and real account/device identity into a private Comradex credential file. Comradex owns subsequent refreshes, including background renewal before expiry. Do not run Claude Code in these `accounts/<name>/native-login` directories: that would create a second refresh owner. Reauthenticate with **Sign In...** in the menubar or `comradex account login <name>`. The menubar launches official Claude Code browser authentication, tracks completion, and refreshes usage after sign-in. Set `CLAUDE_EXECUTABLE` to an absolute executable path if Claude Code is installed outside the usual locations. `account connect` remains specific to existing Codex logins.
 
+For multiple computers, sign each account in separately on each machine. Do not copy `claude-auth.json` between active daemons: independent refreshes of the same rotating grant can invalidate one another. Each machine should own its own login grant, even when both use the same subscription account.
+
 New sessions use the existing prefer/preserve policy:
 
 ```sh
@@ -99,10 +101,13 @@ cargo binstall --git https://github.com/nicosuave/comradex comradex
 ```sh
 git clone git@github.com:nicosuave/comradex.git
 cd comradex
+cargo build --release --locked
 cargo run -- init
 cargo run -- check
 cargo run -- serve
 ```
+
+For an existing configuration, skip `init`. Install the resulting `target/release/comradex` at a stable path before running `comradex service install`; the macOS service records the executable's path. Build the matching menubar app with `macos/ComradexMenu/Scripts/package_app.sh release`. Replacing only the daemon leaves an older menubar without Claude's sign-in UI.
 
 ## Configuration
 
