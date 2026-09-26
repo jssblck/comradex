@@ -65,7 +65,7 @@ comradex account prefer grace --pool claude
 comradex account preserve ada --pool claude
 ```
 
-Healthy sessions stay with their selected account. An explicit shared 5-hour or 7-day quota rejection can move an eligible request to another account before forwarding its response. Signed thinking, compaction, predecessor references, files, and containers keep their owner; an overlapping stream also prevents migration. These cases wait for their account or return an error. Permission errors, ambiguous limits, and interrupted streams never trigger cross-account replay. Background usage polling shows shared 5-hour and 7-day allowance in the menubar and excludes accounts with a confirmed active limit before sending inference. The usage endpoint's own throttling does not mark an account as inference-limited.
+Healthy sessions stay with their selected account. An explicit shared 5-hour or 7-day quota rejection can move an eligible request to another account before forwarding its response. Signed thinking, compaction, predecessor references, files, and containers keep their owner; an overlapping stream also prevents migration. These cases wait for their account or return an error. Permission errors, ambiguous limits, and interrupted streams never trigger cross-account replay. Background usage polling shows shared 5-hour and 7-day allowance in the menubar and excludes accounts with a confirmed active limit before sending inference. The usage endpoint's own throttling does not mark an account as inference-limited; while it persists, checks for that account back off from five minutes up to an hour.
 
 To warm reset Claude windows, enable this separately from Codex's weekly warming:
 

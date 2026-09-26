@@ -81,7 +81,7 @@ impl App {
                 .lock()
                 .await
                 .get(account)
-                .is_some_and(|until| *until > now)
+                .is_some_and(|(until, _)| *until > now)
             {
                 continue;
             }
@@ -103,7 +103,7 @@ impl App {
                         tracing::warn!(account,%error,"Claude window warming failed");
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     success = false;
                     self.stats
                         .usage_fetch_failures
@@ -115,12 +115,12 @@ impl App {
                         .lock()
                         .await
                         .entry(account.clone())
-                        .and_modify(|until| *until = (*until).max(now + 60))
-                        .or_insert(now + 60);
+                        .and_modify(|(until, _)| *until = (*until).max(now + 60))
+                        .or_insert((now + 60, 0));
                     if self.claude.auth.needs_login(path).await {
                         self.router.reauth_required(account).await;
                     }
-                    tracing::warn!(account, "Claude usage refresh unavailable");
+                    tracing::warn!(account, %error, "Claude usage refresh unavailable");
                 }
             }
         }
@@ -182,13 +182,11 @@ impl App {
                                 .ok()
                                 .map(|at| (at.timestamp().max(0) as u64).saturating_sub(now))
                         })
-                    })
-                    .unwrap_or(300);
-                self.claude
-                    .usage_backoff
-                    .lock()
-                    .await
-                    .insert(account.into(), now.saturating_add(retry));
+                    });
+                let mut backoff = self.claude.usage_backoff.lock().await;
+                let previous = backoff.get(account).map_or(0, |(_, delay)| *delay);
+                let delay = usage_throttle_delay(retry, previous);
+                backoff.insert(account.into(), (now.saturating_add(delay), delay));
             }
             ensure!(
                 status.is_success(),
@@ -341,8 +339,29 @@ async fn run_native_warm_with(
     .context("native Claude warming timed out")?
 }
 
+/// Anthropic's usage endpoint answers `retry-after: 0` while it keeps throttling. Poll no
+/// faster than the normal cadence, and double the wait while throttling continues.
+fn usage_throttle_delay(retry_after: Option<u64>, previous: u64) -> u64 {
+    let escalated = if previous == 0 {
+        crate::usage::REFRESH_INTERVAL_SECONDS
+    } else {
+        previous.saturating_mul(2).min(60 * 60)
+    };
+    retry_after.unwrap_or(0).max(escalated)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_throttle_delay_honors_long_retry_after_and_caps_escalation() {
+        use super::usage_throttle_delay;
+        assert_eq!(usage_throttle_delay(Some(0), 0), 300);
+        assert_eq!(usage_throttle_delay(None, 300), 600);
+        assert_eq!(usage_throttle_delay(Some(0), 2400), 3600);
+        assert_eq!(usage_throttle_delay(Some(0), 3600), 3600);
+        assert_eq!(usage_throttle_delay(Some(7200), 0), 7200);
+        assert_eq!(usage_throttle_delay(Some(7200), 7200), 7200);
+    }
     use super::*;
     #[tokio::test]
     #[ignore = "rotates a real managed Claude grant and spends subscription quota; explicitly authorize before running"]

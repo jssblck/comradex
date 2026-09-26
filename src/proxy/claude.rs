@@ -32,7 +32,8 @@ pub(super) struct Claude {
     client: HttpClient,
     upstream: String,
     usage_url: String,
-    usage_backoff: Mutex<HashMap<String, u64>>,
+    /// Per-account usage poll cooldown: (retry at, current throttle delay).
+    usage_backoff: Mutex<HashMap<String, (u64, u64)>>,
     activation: Mutex<Result<crate::claude::maintenance::ActivationLedger>>,
     sessions: Mutex<HashMap<String, Weak<Session>>>,
 }
@@ -673,7 +674,8 @@ mod tests {
                                         } else {
                                             StatusCode::OK
                                         })
-                                        .header("retry-after", "3600")
+                                        // Anthropic's usage endpoint throttles with `retry-after: 0`.
+                                        .header("retry-after", "0")
                                         .body(
                                             Full::new(Bytes::from(
                                                 serde_json::to_vec(&data).unwrap(),
@@ -971,6 +973,32 @@ kind="claude_inbound"
         assert!(harness.app.refresh_claude_usage_at(auth::now() + 1).await);
         assert_eq!(harness.seen.lock().await.len(), 2);
         assert!(harness.app.router.routing_snapshot().await.account_states["grace"].available);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn claude_usage_zero_retry_after_backs_off_from_the_normal_poll_interval() {
+        let harness = Harness::new(true, StatusCode::TOO_MANY_REQUESTS).await;
+        let now = auth::now();
+        assert!(!harness.app.refresh_claude_usage_at(now).await);
+        assert_eq!(harness.seen.lock().await.len(), 2);
+        // A zero retry-after must not become a one-minute polling loop.
+        assert!(harness.app.refresh_claude_usage_at(now + 61).await);
+        assert_eq!(harness.seen.lock().await.len(), 2);
+        let next = now + crate::usage::REFRESH_INTERVAL_SECONDS;
+        assert!(!harness.app.refresh_claude_usage_at(next).await);
+        assert_eq!(harness.seen.lock().await.len(), 4);
+        // Continued throttling doubles the wait.
+        let doubled = next + crate::usage::REFRESH_INTERVAL_SECONDS;
+        assert!(harness.app.refresh_claude_usage_at(doubled).await);
+        assert_eq!(harness.seen.lock().await.len(), 4);
+        assert!(
+            !harness
+                .app
+                .refresh_claude_usage_at(next + 2 * crate::usage::REFRESH_INTERVAL_SECONDS)
+                .await
+        );
+        assert_eq!(harness.seen.lock().await.len(), 6);
         harness.close().await;
     }
 
