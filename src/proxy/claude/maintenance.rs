@@ -198,7 +198,12 @@ impl App {
                 .observe_claude_usage_for_owner(account, snapshot.clone(), &credential.owner())
                 .await;
             self.router.proactive_auth_ready(account).await;
-            self.claude.usage_backoff.lock().await.remove(account);
+            // The shared usage loop reruns within a minute whenever another account fails.
+            // Keep this account on the normal cadence regardless.
+            self.claude.usage_backoff.lock().await.insert(
+                account.into(),
+                (now + crate::usage::REFRESH_INTERVAL_SECONDS, 0),
+            );
             return Ok((snapshot, credential));
         }
         bail!("Claude usage authentication failed")

@@ -977,6 +977,21 @@ kind="claude_inbound"
     }
 
     #[tokio::test]
+    async fn claude_usage_success_keeps_the_normal_poll_interval() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let now = auth::now();
+        assert!(harness.app.refresh_claude_usage_at(now).await);
+        let polled = harness.seen.lock().await.len();
+        // Another account's failure reruns the shared usage loop within a minute.
+        assert!(harness.app.refresh_claude_usage_at(now + 60).await);
+        assert_eq!(harness.seen.lock().await.len(), polled);
+        let next = now + crate::usage::REFRESH_INTERVAL_SECONDS;
+        assert!(harness.app.refresh_claude_usage_at(next).await);
+        assert!(harness.seen.lock().await.len() > polled);
+        harness.close().await;
+    }
+
+    #[tokio::test]
     async fn claude_usage_zero_retry_after_backs_off_from_the_normal_poll_interval() {
         let harness = Harness::new(true, StatusCode::TOO_MANY_REQUESTS).await;
         let now = auth::now();
