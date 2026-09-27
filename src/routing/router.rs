@@ -228,7 +228,41 @@ impl AccountRuntime {
     }
 }
 
+pub(crate) struct ResetCreditMarker(Option<Instant>);
+
 impl Router {
+    pub(crate) async fn reset_credit_marker(
+        &self,
+        account: &str,
+        owner: &QuotaOwner,
+    ) -> Option<ResetCreditMarker> {
+        let mut accounts = self.accounts.lock().await;
+        let runtime = accounts.get_mut(account)?;
+        self.accepts_quota_owner(account, runtime, owner)
+            .then_some(ResetCreditMarker(runtime.quota_until))
+    }
+
+    pub(crate) async fn confirm_credit_reset(
+        &self,
+        account: &str,
+        owner: &QuotaOwner,
+        marker: ResetCreditMarker,
+    ) {
+        let mut accounts = self.accounts.lock().await;
+        let Some(runtime) = accounts.get_mut(account) else {
+            return;
+        };
+        if !self.accepts_quota_owner(account, runtime, owner) || runtime.quota_until != marker.0 {
+            return;
+        }
+        runtime.quota_until = None;
+        runtime.quota_reset_at = None;
+        runtime.quota_evidence = None;
+        runtime.usage = None;
+        runtime.usage_updated_at_unix = None;
+        runtime.usage_windows.clear();
+    }
+
     async fn account_runtimes(
         &self,
     ) -> tokio::sync::MutexGuard<'_, HashMap<String, AccountRuntime>> {

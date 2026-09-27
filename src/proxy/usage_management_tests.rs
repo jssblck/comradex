@@ -30,6 +30,10 @@ impl Drop for Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_credit_upstream(None).await
+    }
+
+    async fn with_credit_upstream(upstream: Option<&str>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut accounts = BTreeMap::new();
         for (name, claude) in [("ada", false), ("grace", true), ("anna", true)] {
@@ -105,7 +109,12 @@ impl Fixture {
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new(config, router, Arc::new(Stats::default())).unwrap();
+        let mut app = App::new(config, router, Arc::new(Stats::default())).unwrap();
+        if let Some(upstream) = upstream {
+            let app = Arc::get_mut(&mut app).unwrap();
+            app.reset_credits.codex_url = format!("{upstream}/credits").parse().unwrap();
+            app.usage_url = format!("{upstream}/usage").parse().unwrap();
+        }
         let mut fixture = Self {
             app,
             urls: Vec::new(),
@@ -330,7 +339,7 @@ async fn management_rejects_missing_or_wrong_keys_nonloopback_listeners_and_inva
             "auth-files?key=ignored",
             StatusCode::BAD_REQUEST,
         ),
-        (Method::POST, "reset-quota", StatusCode::NOT_FOUND),
+        (Method::POST, "unsupported-operation", StatusCode::NOT_FOUND),
     ] {
         assert_eq!(
             client
@@ -388,7 +397,7 @@ async fn management_never_forwards_arbitrary_urls_methods_or_other_accounts() {
         (
             "ada",
             "GET",
-            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits?unsupported=1",
             StatusCode::BAD_REQUEST,
         ),
     ] {
@@ -516,3 +525,5 @@ async fn management_exposes_only_matching_account_metadata_for_t3_deduplication(
     assert!(value["files"][2].get("email").is_none());
     fixture.app.shutdown_connections().await;
 }
+
+include!("reset_credit_tests.rs");

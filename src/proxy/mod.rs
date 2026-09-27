@@ -23,6 +23,7 @@ mod native_control;
 #[cfg(test)]
 mod native_control_tests;
 mod replay_body;
+mod reset_credits;
 #[allow(dead_code)]
 mod sse;
 mod usage_activation;
@@ -800,6 +801,7 @@ pub struct App {
     live_calls: LiveCallStore,
     auth: auth::Resolver,
     usage_url: Uri,
+    reset_credits: reset_credits::ResetCredits,
     usage_activation: AsyncMutex<Result<crate::usage_activation::UsageActivationLedger>>,
     file_owners: Arc<AffinityStore>,
     context_store: context_store::ContextStore,
@@ -841,6 +843,7 @@ impl App {
         auth.health = router.auth_health.clone();
         Ok(Arc::new(Self {
             claude: claude::Claude::new(&config)?,
+            reset_credits: reset_credits::ResetCredits::default(),
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             bridge_turn_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             upgrade_slots: Arc::new(Semaphore::new(config.proxy.max_upgrades)),

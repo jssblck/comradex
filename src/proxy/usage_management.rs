@@ -12,6 +12,14 @@ struct ApiCall {
     auth_index: String,
     method: String,
     url: String,
+    #[serde(default)]
+    data: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResetQuota {
+    auth_index: String,
 }
 
 impl App {
@@ -74,9 +82,12 @@ impl App {
                     .collect();
                 management_json(json!({ "files": files }))
             }
-            "/v0/management/api-call" if request.method() == Method::POST => {
-                // This endpoint projects existing observations; caller-supplied URLs and
-                // headers must never become authenticated outbound requests.
+            "/v0/management/api-call" | "/v0/management/reset-quota"
+                if request.method() == Method::POST =>
+            {
+                let reset_quota = request.uri().path() == "/v0/management/reset-quota";
+                // Request headers are never forwarded; each permitted operation constructs
+                // its own fixed provider URL and account authentication.
                 let body = tokio::time::timeout(
                     HTTP_UPSTREAM_UPLOAD_IDLE_TIMEOUT,
                     Limited::new(request.into_body(), MAX_USAGE_RESPONSE_BYTES).collect(),
@@ -92,6 +103,16 @@ impl App {
                         );
                     }
                 };
+                if reset_quota {
+                    let Ok(call) = serde_json::from_slice::<ResetQuota>(&bytes) else {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            "invalid reset acknowledgment",
+                        );
+                    };
+                    return self.acknowledge_credit_reset(&call.auth_index).await;
+                }
                 let call: ApiCall = match serde_json::from_slice(&bytes) {
                     Ok(call) => call,
                     Err(_) => {
@@ -104,7 +125,9 @@ impl App {
                 };
                 self.management_usage(call).await
             }
-            "/v0/management/auth-files" | "/v0/management/api-call" => error_response(
+            "/v0/management/auth-files"
+            | "/v0/management/api-call"
+            | "/v0/management/reset-quota" => error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method_not_allowed",
                 "unsupported method",
@@ -131,16 +154,39 @@ impl App {
             );
         };
         let claude = account.is_claude();
-        let expected_url = if claude {
-            CLAUDE_USAGE_URL
+        if !claude
+            && call.url == reset_credits::CODEX_CREDITS_URL
+            && call.method == "GET"
+            && call.data.is_none()
+        {
+            return self.codex_reset_credits(&call.auth_index, None).await;
+        }
+        if !claude
+            && call.url == format!("{}/consume", reset_credits::CODEX_CREDITS_URL)
+            && call.method == "POST"
+        {
+            let Some(credit) = reset_credits::ConsumeCredit::parse(call.data.as_deref()) else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "invalid reset credit",
+                );
+            };
+            return self
+                .codex_reset_credits(&call.auth_index, Some(credit))
+                .await;
+        }
+        let allowed_usage = if claude {
+            call.url == CLAUDE_USAGE_URL
+                || call.url == format!("{CLAUDE_USAGE_URL}?cedar_ember=1&skip_spend=1")
         } else {
-            usage::USAGE_URL
+            call.url == usage::USAGE_URL
         };
-        if call.method != "GET" || call.url != expected_url {
+        if call.method != "GET" || !allowed_usage || call.data.is_some() {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "unsupported_usage_request",
-                "only this account's provider usage GET is supported",
+                "unsupported provider usage or reset-credit operation",
             );
         }
         let snapshot = self.router.routing_snapshot().await;
@@ -194,6 +240,9 @@ impl App {
             return usage_unavailable();
         }
         let body = if claude {
+            if let Some(credits) = self.claude_reset_credits(&call.auth_index).await {
+                windows.insert("cedar_ember".into(), credits);
+            }
             Value::Object(windows)
         } else {
             json!({ "rate_limit": windows })
@@ -218,7 +267,7 @@ fn managed_provider(account: &AccountConfig) -> Option<&'static str> {
     }
 }
 
-fn management_json(value: Value) -> Response<ProxyBody> {
+pub(super) fn management_json(value: Value) -> Response<ProxyBody> {
     Response::builder()
         .header(CONTENT_TYPE, "application/json")
         .header("cache-control", "no-store")
@@ -276,4 +325,12 @@ fn account_metadata(account: &AccountConfig) -> Option<Value> {
         _ => return None,
     }
     Some(metadata)
+}
+
+pub(super) fn api_response(status: StatusCode, body: Value) -> Response<ProxyBody> {
+    management_json(json!({
+        "status_code": status.as_u16(),
+        "header": { "Content-Type": ["application/json"] },
+        "body": body.to_string(),
+    }))
 }
