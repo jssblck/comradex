@@ -76,6 +76,45 @@ The usage worker checks every five minutes; the menubar's Refresh requests an ea
 
 See [Claude Code requests](#claude-code-requests) for what the relay changes and its limits.
 
+## Usage reporting for T3 Code
+
+Comradex exposes a read-only subset of the CLIProxyAPI management API on its
+loopback Codex and Claude listeners. One connection reports all managed accounts.
+
+1. Open **Settings > Providers > Usage providers > Add hub** in T3 Code.
+2. Select the environment running Comradex.
+3. Enter a listener's origin, such as `http://127.0.0.1:10101`.
+4. Use `proxy.installation_secret` from `comradex.toml` as the management key.
+5. Open **Usage > Limits** to see the accounts' session and weekly windows.
+
+Use the listener origin without the secret path or `/v1` suffix. The Desktop
+backend listener does not expose this API. Accounts use their Comradex names;
+accounts that forward the requesting client's login are excluded. Available account
+emails let T3 deduplicate subscriptions also reported by native providers. Codex
+plan metadata is included when available.
+
+The supported endpoints are:
+
+- `GET /v0/management/auth-files`: account IDs, provider names, and account selectors.
+- `POST /v0/management/api-call`: a `GET` of the selected account's provider usage URL.
+
+Both require `Authorization: Bearer <installation_secret>`. The API-call body
+uses CLIProxyAPI's `auth_index`, `method`, and `url` fields. It accepts only
+`https://api.anthropic.com/api/oauth/usage` for Claude and
+`https://chatgpt.com/backend-api/wham/usage` for Codex. The response contains
+`status_code`, `header`, and a JSON-encoded `body` string.
+
+Reporting uses Comradex's latest quota observations. Reading the hub does not
+fetch upstream, refresh credentials, or change account selection. The existing
+background worker updates usage; its polling interval and throttling backoff
+still apply. The response's `header.X-Comradex-Usage-Updated-At`, when available,
+records the observation time as Unix seconds. Accounts awaiting usage or sign-in
+return an unavailable result. Token credentials are never returned.
+
+This integration supplies quota reporting only. Reset-credit operations and
+other CLIProxyAPI management features are unsupported. Configure inference
+routing separately as described above.
+
 ## Installation
 
 ### Prebuilt binaries

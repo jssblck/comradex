@@ -26,6 +26,9 @@ mod replay_body;
 #[allow(dead_code)]
 mod sse;
 mod usage_activation;
+mod usage_management;
+#[cfg(test)]
+mod usage_management_tests;
 #[allow(dead_code)]
 mod websocket_protocol;
 
@@ -1187,6 +1190,8 @@ impl App {
     ) -> Result<Response<ProxyBody>, Infallible> {
         let response = if self.service_health_path(req.uri()) {
             self.health_response()
+        } else if Self::usage_management_path(req.uri()) {
+            self.handle_usage_management(req, &listener).await
         } else if self.config.is_claude_pool(&listener.pool) {
             self.handle_claude(req, &listener)
                 .await
