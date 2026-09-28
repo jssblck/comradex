@@ -444,7 +444,7 @@ async fn management_reports_unavailable_until_usage_exists_and_during_login() {
 }
 
 #[tokio::test]
-async fn management_exposes_only_matching_account_metadata_for_t3_deduplication() {
+async fn management_exposes_only_matching_account_metadata_for_client_deduplication() {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let fixture = Fixture::new().await;
     let codex_home = fixture.app.config.accounts["ada"].home().unwrap();

@@ -76,22 +76,23 @@ The usage worker checks every five minutes; the menubar's Refresh requests an ea
 
 See [Claude Code requests](#claude-code-requests) for what the relay changes and its limits.
 
-## Usage reporting for T3 Code
+## Usage endpoint
 
-Comradex exposes a subset of the CLIProxyAPI management API on its loopback
-Codex and Claude listeners. One connection reports all managed accounts.
+Comradex's loopback Codex and Claude listeners expose a usage endpoint that
+reports quota windows and reset credits for all managed accounts. It implements
+a subset of the CLIProxyAPI management API, so clients that read usage from
+CLIProxyAPI can read it from Comradex.
 
-1. Open **Settings > Providers > Usage providers > Add hub** in T3 Code.
-2. Select the environment running Comradex.
-3. Enter a listener's origin, such as `http://127.0.0.1:10101`.
-4. Use `proxy.installation_secret` from `comradex.toml` as the management key.
-5. Open **Usage > Limits** to see quota windows and available Codex resets.
+To connect a client, give it:
+
+- a listener's origin, such as `http://127.0.0.1:10101`, as the server URL.
+- `proxy.installation_secret` from `comradex.toml` as the management key.
 
 Use the listener origin without the secret path or `/v1` suffix. The Desktop
 backend listener does not expose this API. Accounts use their Comradex names;
-accounts that forward the requesting client's login are excluded. Available
-account emails let T3 deduplicate subscriptions also reported by native providers.
-Codex plan metadata is included when available.
+accounts that forward the requesting client's login are excluded. Account
+emails are included when available, so clients can deduplicate subscriptions
+they also read from other sources. Codex plan metadata is included when available.
 
 All management endpoints require `Authorization: Bearer <installation_secret>`:
 
@@ -121,11 +122,11 @@ time as Unix seconds. Accounts awaiting usage or sign-in return an unavailable
 result. Token credentials are never returned.
 
 Codex reset-credit reads fetch the selected account's current provider data.
-T3's **Use reset** action sends `credit_id` and a UUID `redeem_request_id` in
-`data`. Keep the same request ID when retrying an uncertain result. Comradex
-does not retry redemption automatically. Only a confirmed new reset clears the
-account's quota cooldown and old usage; newer rejections and account changes
-are preserved. An already-redeemed receipt cannot clear a subsequent block.
+To redeem a reset, a client POSTs to the consume URL with `credit_id` and a UUID
+`redeem_request_id` in `data`. Keep the same request ID when retrying an
+uncertain result. Comradex does not retry redemption automatically. Only a
+confirmed new reset clears the account's quota cooldown and old usage; newer
+rejections and account changes are preserved. An already-redeemed receipt cannot clear a subsequent block.
 Other provider outcomes and errors leave the cooldown intact.
 
 Claude's normal background usage poll requests reset-credit metadata and
@@ -133,9 +134,8 @@ preserves the provider's `cedar_ember` block in both supported usage responses.
 The existing polling cadence and throttling backoff still apply. Reading the
 cached Claude response makes no extra provider request. The data remains tied
 to the credential's account identity and is replaced on the next successful poll.
-This makes Claude reset data available to hub clients that understand it;
-the current T3 hub client does not display it yet. Claude redemption is not
-implemented.
+Clients that understand this block can show Claude reset credits. Claude
+redemption is not implemented.
 
 Reading usage or reset-credit availability never consumes a reset. Other
 CLIProxyAPI management operations are unsupported. Configure inference routing
