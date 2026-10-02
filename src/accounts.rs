@@ -11,6 +11,15 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item, value};
 
+/// Managed accounts read auth.json. Inheriting `auto` or `keyring` can make Codex
+/// report a successful login without writing credentials Comradex can use.
+pub const CODEX_DEVICE_LOGIN_ARGS: [&str; 4] = [
+    "-c",
+    "cli_auth_credentials_store=\"file\"",
+    "login",
+    "--device-auth",
+];
+
 /// Locate the login used by the requesting user's Codex CLI.
 pub fn default_codex_home() -> Result<PathBuf> {
     default_codex_home_from(std::env::var_os("CODEX_HOME"), std::env::var_os("HOME"))

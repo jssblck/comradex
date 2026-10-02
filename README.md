@@ -142,7 +142,9 @@ Then authenticate through the official client:
 comradex account login personal_2
 ```
 
-This executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`.
+This executes `codex -c 'cli_auth_credentials_store="file"' login --device-auth` with `CODEX_HOME` set to the isolated directory. Both CLI and menubar logins require a readable ChatGPT `auth.json` before reporting success. Absolute account paths are used unchanged; relative paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`.
+
+Keep managed account homes separate from a desktop Codex home that uses `auto` or `keyring` credential storage. Codex removes `auth.json` in that home when it saves credentials to Keychain, including after a later login or refresh. To use the same ChatGPT account in both applications, sign it into an isolated Comradex account home; the two logins then have independent storage and refresh tokens while sharing the account's quota.
 
 For each request, the daemon reads the account's `auth.json`, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. A bounded background sweep checks managed accounts once per minute and refreshes only tokens within five minutes of expiry, so rarely selected accounts do not depend on request-time refresh. Refreshes are single-flight per normalized, non-overlapping account home and atomically rotate `auth.json`; permanent refresh rejection marks only that account as requiring device login. This includes an existing Codex login explicitly connected as a `codex_home` account. Credentials forwarded by an `inbound` account remain unmanaged.
 

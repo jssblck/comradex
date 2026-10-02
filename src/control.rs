@@ -348,7 +348,12 @@ impl LoginManager {
         let task = tokio::spawn(async move {
             let result: Result<bool> = async {
                 let _auth_lock = HomeAuthLock::acquire_async(&home).await?;
-                manager.runner.run(home, output.clone()).await
+                if !manager.runner.run(home.clone(), output.clone()).await? {
+                    return Ok(false);
+                }
+                // A successful child exit can still leave credentials in Keychain or
+                // no usable file at all. Check while login still owns the home lock.
+                Ok(crate::auth::validate_existing_login(&home).is_ok())
             }
             .await;
             let state = match &result {
@@ -441,8 +446,7 @@ impl LoginManager {
 async fn run_codex_login(home: PathBuf, output: SharedLoginOutput) -> Result<bool> {
     let executable = resolve_codex_executable()?;
     let mut child = Command::new(&executable)
-        .arg("login")
-        .arg("--device-auth")
+        .args(accounts::CODEX_DEVICE_LOGIN_ARGS)
         .env("CODEX_HOME", &home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1534,6 +1538,8 @@ kind = "inbound"
     #[derive(Clone, Copy)]
     enum FakeLoginOutcome {
         Success,
+        SuccessWithoutCredentials,
+        SuccessWithMalformedCredentials,
         ExitFailure,
         RunnerError,
     }
@@ -1560,7 +1566,18 @@ kind = "inbound"
                 started.notify_one();
                 finish.notified().await;
                 match outcome {
-                    FakeLoginOutcome::Success => Ok(true),
+                    FakeLoginOutcome::Success => {
+                        fs::write(
+                            home.join("auth.json"),
+                            r#"{"tokens":{"access_token":"test-access-token"}}"#,
+                        )?;
+                        Ok(true)
+                    }
+                    FakeLoginOutcome::SuccessWithoutCredentials => Ok(true),
+                    FakeLoginOutcome::SuccessWithMalformedCredentials => {
+                        fs::write(home.join("auth.json"), "private malformed credentials")?;
+                        Ok(true)
+                    }
                     FakeLoginOutcome::ExitFailure => Ok(false),
                     FakeLoginOutcome::RunnerError => bail!("private runner detail"),
                 }
@@ -1852,6 +1869,14 @@ path = "accounts/work"
     #[tokio::test]
     async fn managed_login_failure_is_stable_and_restores_routing_availability() {
         for (outcome, expected_error) in [
+            (
+                FakeLoginOutcome::SuccessWithoutCredentials,
+                "codex_login_failed",
+            ),
+            (
+                FakeLoginOutcome::SuccessWithMalformedCredentials,
+                "codex_login_failed",
+            ),
             (FakeLoginOutcome::ExitFailure, "codex_login_failed"),
             (FakeLoginOutcome::RunnerError, "codex_login_unavailable"),
         ] {
