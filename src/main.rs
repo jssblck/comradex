@@ -1174,8 +1174,7 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
     service::while_daemon_stopped(|| {
         login_managed_home_with(path, |path| {
             let status = Command::new("codex")
-                .arg("login")
-                .arg("--device-auth")
+                .args(comradex::accounts::CODEX_DEVICE_LOGIN_ARGS)
                 .env("CODEX_HOME", path)
                 .status()
                 .context("launch codex device login")?;
@@ -1190,7 +1189,9 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
 fn login_managed_home_with(path: &Path, run_login: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     fs::create_dir_all(path)?;
     let _guard = HomeAuthLock::acquire(path)?;
-    run_login(path)
+    run_login(path)?;
+    comradex::auth::validate_existing_login(path)
+        .context("Codex login finished without a readable file-based ChatGPT login")
 }
 
 fn state_dir(config: &Config) -> PathBuf {
@@ -1355,6 +1356,10 @@ mod tests {
 
         login_managed_home_with(&home, |child_home| {
             assert!(HomeAuthLock::try_acquire(child_home)?.is_none());
+            fs::write(
+                child_home.join("auth.json"),
+                r#"{"tokens":{"access_token":"test-access-token"}}"#,
+            )?;
             Ok(())
         })
         .unwrap();
@@ -1372,6 +1377,33 @@ mod tests {
 
         assert!(error.to_string().contains("simulated child failure"));
         assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+    }
+
+    #[test]
+    fn managed_login_rejects_success_without_readable_chatgpt_credentials() {
+        for contents in [
+            None,
+            Some("{}"),
+            Some("not-json"),
+            Some(r#"{"OPENAI_API_KEY":"private-test-key"}"#),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("managed");
+            let error = login_managed_home_with(&home, |child_home| {
+                if let Some(contents) = contents {
+                    fs::write(child_home.join("auth.json"), contents)?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("without a readable file-based ChatGPT login")
+            );
+            assert!(!format!("{error:#}").contains("private-test-key"));
+            assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+        }
     }
 
     #[test]
