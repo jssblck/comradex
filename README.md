@@ -406,4 +406,17 @@ comradex status --json
 
 `status` summarizes the configuration, LaunchAgent, Codex wiring, accounts, per-pool preferred and active accounts, and live traffic. While the daemon is running, routing status comes directly from its authenticated local control socket; the bounded `stats.json` snapshot is the fallback and is also updated periodically. `--json` prints that snapshot with the latest live routing state. When running from source, use `cargo run -- status`. There is deliberately no credentialed admin HTTP endpoint.
 
+Reset credits are tracked separately from quota-window resets. `comradex status` includes available reset counts and each credit's exact RFC3339 expiration timestamp; JSON exposes the server timestamps unchanged under `routing.account_states.<account>.reset_credits`. Credits refresh with the usage sweep and the menu's Refresh action. Expired credits are excluded from the displayed available count. A failed detail lookup is shown as unavailable, not as a zero balance.
+
+```sh
+comradex account reset-credits personal
+comradex account reset-credits personal --json
+# Explicitly consumes the selected credit:
+comradex account use-reset personal --credit-id CREDIT_ID --confirm
+```
+
+The read command fetches fresh data from the running daemon. The menu's account submenu contains **N resets available**; expanding it lists available credits with precise expiry. Clicking a credit directly opens a confirmation with Cancel selected by default. Redemption always names a specific account and credit, then refreshes usage. It never happens automatically. The CLI prints a request ID before submitting; if the outcome is unknown, refresh the credits and reuse that ID with `--request-id` when retrying. The menu retains the same request ID for retries during that app session. Inbound accounts must first be connected to a Codex login.
+
+The running daemon retains the most recent reset attempt per account. Explicit retries with the original identity, credit, and request ID can reconcile a consumed credit even if it disappears from the credit list; confirmed results are returned without another consumption request. Late confirmations never clear a newer quota rejection. This retry state lasts for the daemon's lifetime.
+
 The menu app communicates directly with the daemon through a local socket accessible only to your macOS user. It reads status, changes account settings, and starts the official Codex device-login flow. The app displays the login URL, authorization code, and progress without handling account credentials.

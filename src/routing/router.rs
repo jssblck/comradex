@@ -107,6 +107,8 @@ pub struct AccountRoutingStatus {
     pub quota_windows: BTreeMap<String, QuotaWindowStatus>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usage_windows: BTreeMap<String, QuotaWindowStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
     /// Soft preference for fresh admissions only; the account remains available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_backoff_until_unix: Option<i64>,
@@ -124,12 +126,14 @@ pub struct QuotaWindowStatus {
 
 #[derive(Debug, Default)]
 struct AccountRuntime {
+    quota_failure_generation: u64,
     quota_owner: Option<QuotaOwner>,
     reauth_required: bool,
     bearer_unusable: bool,
     usage: Option<u8>,
     usage_updated_at_unix: Option<i64>,
     usage_windows: BTreeMap<String, QuotaWindowStatus>,
+    reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
     inflight: u64,
     last_assigned: u64,
     needs_login: bool,
@@ -245,7 +249,8 @@ impl Router {
                 && (runtime.quota_until.is_some()
                     || runtime.quota_evidence.is_some()
                     || runtime.usage.is_some()
-                    || !runtime.usage_windows.is_empty())
+                    || !runtime.usage_windows.is_empty()
+                    || runtime.reset_credits.is_some())
             {
                 self.reconcile_quota_owner(name, runtime);
             }
@@ -281,6 +286,8 @@ impl Router {
             runtime.usage = None;
             runtime.usage_updated_at_unix = None;
             runtime.usage_windows.clear();
+            runtime.reset_credits = None;
+            runtime.quota_failure_generation = runtime.quota_failure_generation.wrapping_add(1);
             runtime.quota_owner = None;
         }
     }
@@ -957,6 +964,7 @@ impl Router {
                 chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX),
             );
             a.quota_evidence = (!evidence.is_empty()).then_some(evidence);
+            a.quota_failure_generation = a.quota_failure_generation.wrapping_add(1);
         }
     }
     pub async fn soft_failure(&self, account: &str) {
@@ -1122,6 +1130,51 @@ impl Router {
             }
         }
     }
+    pub async fn observe_reset_credits_for_owner(
+        &self,
+        account: &str,
+        snapshot: Option<crate::reset_credits::ResetCreditsSnapshot>,
+        owner: &QuotaOwner,
+    ) {
+        if let Some(runtime) = self.accounts.lock().await.get_mut(account)
+            && self.accepts_quota_owner(account, runtime, owner)
+        {
+            runtime.reset_credits = snapshot;
+        }
+    }
+
+    pub async fn reset_generation_for_owner(
+        &self,
+        account: &str,
+        owner: &QuotaOwner,
+    ) -> Option<u64> {
+        let mut accounts = self.accounts.lock().await;
+        let runtime = accounts.get_mut(account)?;
+        self.accepts_quota_owner(account, runtime, owner)
+            .then_some(runtime.quota_failure_generation)
+    }
+
+    /// A confirmed manual reset invalidates pre-request evidence even when its
+    /// deadline is unchanged. A delayed confirmation must not clear a newer 429.
+    pub async fn confirm_reset_for_owner(
+        &self,
+        account: &str,
+        owner: &QuotaOwner,
+        generation: u64,
+    ) {
+        if let Some(runtime) = self.accounts.lock().await.get_mut(account)
+            && self.accepts_quota_owner(account, runtime, owner)
+            && runtime.quota_failure_generation == generation
+        {
+            runtime.quota_until = None;
+            runtime.quota_reset_at = None;
+            runtime.quota_evidence = None;
+            runtime.usage = None;
+            runtime.usage_updated_at_unix = None;
+            runtime.usage_windows.clear();
+        }
+    }
+
     pub async fn record_count(&self) -> usize {
         self.accounts.lock().await.len()
     }
@@ -1224,6 +1277,7 @@ fn account_routing_status(
         inflight: runtime.inflight,
         quota_windows,
         usage_windows: runtime.usage_windows.clone(),
+        reset_credits: runtime.reset_credits.clone(),
         capacity_backoff_until_unix: runtime.capacity.until.filter(|until| *until > now).map(
             |until| {
                 wall_now.timestamp()
@@ -1586,6 +1640,7 @@ mod tests {
         let pool = &cfg.pools["default"];
         // A usage poll reports b's weekly window fully used before any upstream rejection.
         let snapshot = crate::usage::UsageSnapshot {
+            reset_credits_available: None,
             observed_at_unix: Utc::now().timestamp(),
             windows: BTreeMap::from([(
                 "secondary".into(),

@@ -6,6 +6,7 @@ pub mod config;
 pub mod control;
 pub mod install;
 pub mod proxy;
+pub mod reset_credits;
 pub mod routing;
 pub mod service;
 pub mod state;

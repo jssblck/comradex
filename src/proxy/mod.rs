@@ -22,6 +22,7 @@ mod native_control;
 #[cfg(test)]
 mod native_control_tests;
 mod replay_body;
+mod reset_credits;
 #[allow(dead_code)]
 mod sse;
 mod usage_activation;
@@ -795,6 +796,7 @@ pub struct App {
     live_calls: LiveCallStore,
     auth: auth::Resolver,
     usage_url: Uri,
+    usage_locks: HashMap<String, AsyncMutex<Option<reset_credits::ResetAttempt>>>,
     usage_activation: AsyncMutex<Result<crate::usage_activation::UsageActivationLedger>>,
     file_owners: Arc<AffinityStore>,
     context_store: context_store::ContextStore,
@@ -857,6 +859,11 @@ impl App {
             ),
             auth,
             usage_url: usage::USAGE_URL.parse().expect("static usage URL is valid"),
+            usage_locks: config
+                .accounts
+                .keys()
+                .map(|name| (name.clone(), AsyncMutex::new(None)))
+                .collect(),
             usage_activation: AsyncMutex::new(
                 crate::usage_activation::UsageActivationLedger::open(
                     state_dir.join("usage-activation.json"),
@@ -1027,6 +1034,24 @@ impl App {
         account: &crate::config::AccountConfig,
         now: u64,
     ) -> Result<(usage::UsageSnapshot, Credentials)> {
+        // Serialize reads and redemption for this account, so an older poll cannot
+        // overwrite the authoritative snapshot obtained after a reset.
+        let _guard = self
+            .usage_locks
+            .get(account_id)
+            .context("unknown account")?
+            .lock()
+            .await;
+        self.fetch_managed_usage_account_locked(account_id, account, now)
+            .await
+    }
+
+    async fn fetch_managed_usage_account_locked(
+        &self,
+        account_id: &str,
+        account: &crate::config::AccountConfig,
+        now: u64,
+    ) -> Result<(usage::UsageSnapshot, Credentials)> {
         let inbound = hyper::HeaderMap::new();
         let mut credentials = self.auth.resolve(account, &inbound).await?;
         let (mut status, mut bytes) = self.fetch_usage_once(&credentials).await?;
@@ -1050,19 +1075,40 @@ impl App {
                 &credentials.quota_owner(),
             )
             .await;
+        self.refresh_reset_credits(account_id, &credentials, snapshot.reset_credits_available)
+            .await;
         Ok((snapshot, credentials))
     }
 
     async fn fetch_usage_once(&self, credentials: &Credentials) -> Result<(StatusCode, Vec<u8>)> {
-        let mut request = Request::get(self.usage_url.clone())
+        self.fetch_account_endpoint(
+            credentials,
+            Method::GET,
+            self.usage_url.clone(),
+            empty_body(),
+        )
+        .await
+    }
+
+    async fn fetch_account_endpoint(
+        &self,
+        credentials: &Credentials,
+        method: Method,
+        url: Uri,
+        body: ProxyBody,
+    ) -> Result<(StatusCode, Vec<u8>)> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(url)
             .header(AUTHORIZATION, credentials.authorization.as_str())
-            .header(ACCEPT, "application/json");
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json");
         if let Some(account_id) = credentials.account_id.as_deref() {
             request = request.header("chatgpt-account-id", account_id);
         }
         let response = tokio::time::timeout(
             USAGE_FETCH_TIMEOUT,
-            self.client.request(request.body(empty_body())?),
+            self.client.request(request.body(body)?),
         )
         .await
         .context("Codex usage request timed out")??;
@@ -6524,6 +6570,7 @@ mod tests {
     include!("quota_identity_tests.rs");
     include!("scoped_quota_tests.rs");
     include!("usage_activation_tests.rs");
+    include!("reset_credit_tests.rs");
     use super::*;
     use crate::{
         config::{AccountConfig, ProxyConfig, ResponsesWebsocketMode},

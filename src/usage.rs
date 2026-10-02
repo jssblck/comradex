@@ -12,11 +12,13 @@ pub const REFRESH_INTERVAL_SECONDS: u64 = 5 * 60;
 pub struct UsageSnapshot {
     pub observed_at_unix: i64,
     pub windows: BTreeMap<String, QuotaWindowStatus>,
+    pub reset_credits_available: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WhamUsageResponse {
     rate_limit: Option<WhamRateLimit>,
+    rate_limit_reset_credits: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +74,11 @@ pub fn parse_usage_response(bytes: &[u8], observed_at_unix: i64) -> Result<Usage
     Ok(UsageSnapshot {
         observed_at_unix,
         windows,
+        reset_credits_available: response.rate_limit_reset_credits.and_then(|summary| {
+            summary
+                .get("available_count")
+                .and_then(serde_json::Value::as_u64)
+        }),
     })
 }
 
