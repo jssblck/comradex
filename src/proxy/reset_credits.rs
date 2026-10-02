@@ -1,6 +1,25 @@
 use super::*;
 use crate::reset_credits::{ResetCreditsResponse, ResetCreditsSnapshot, ResetOutcome, ResetResult};
 
+/// Held under the account's usage lock. An uncertain POST may only be retried
+/// with its original identity and target; successful replies are replayed locally.
+pub(super) struct ResetAttempt {
+    owner: auth::QuotaOwner,
+    bearer_fingerprint: blake3::Hash,
+    credit_id: String,
+    request_id: String,
+    quota_generation: u64,
+    result: Option<ResetResult>,
+}
+
+impl ResetAttempt {
+    fn matches_owner(&self, credentials: &Credentials) -> bool {
+        self.owner == credentials.quota_owner()
+            && (self.owner.is_known()
+                || self.bearer_fingerprint == blake3::hash(credentials.authorization.as_bytes()))
+    }
+}
+
 impl App {
     // Derive both endpoints from the usage origin, including in tests. Tests cannot
     // accidentally fall through to a production reset endpoint.
@@ -113,28 +132,66 @@ impl App {
             bail!("a credit ID and a stable request ID are required");
         }
         let account = self.managed_reset_account(account_name)?;
-        let _action = self
+        let mut action = self
             .usage_locks
             .get(account_name)
             .context("unknown account")?
             .try_lock()
             .context("usage refresh or reset already in progress; try again shortly")?;
         let credentials = self.auth.resolve(account, &hyper::HeaderMap::new()).await?;
-        let details = self.fetch_reset_credit_details(&credentials).await?;
-        let credit = details
-            .credits
-            .iter()
-            .find(|credit| credit.id == credit_id)
-            .context("selected reset credit no longer exists; refresh its status")?;
-        if !credit.can_redeem_at(chrono::Utc::now()) {
-            bail!(
-                "selected reset credit is expired, unavailable, or unsupported; refresh its status"
-            );
+        let is_retry = match action.as_ref() {
+            Some(previous) if previous.request_id == request_id => {
+                if previous.credit_id != credit_id || !previous.matches_owner(&credentials) {
+                    bail!("reset retry must use the original account identity and credit");
+                }
+                if let Some(result) = &previous.result {
+                    return Ok(result.clone());
+                }
+                true
+            }
+            Some(previous) if previous.result.is_none() && previous.matches_owner(&credentials) => {
+                bail!(
+                    "previous reset outcome is unknown; retry its original credit and request ID"
+                );
+            }
+            _ => false,
+        };
+        if !is_retry {
+            let details = self.fetch_reset_credit_details(&credentials).await?;
+            let credit = details
+                .credits
+                .iter()
+                .find(|credit| credit.id == credit_id)
+                .context("selected reset credit no longer exists; refresh its status")?;
+            if !credit.can_redeem_at(chrono::Utc::now()) {
+                bail!(
+                    "selected reset credit is expired, unavailable, or unsupported; refresh its status"
+                );
+            }
         }
         let current = self.auth.resolve(account, &hyper::HeaderMap::new()).await?;
-        if current.quota_owner() != credentials.quota_owner() {
+        let owner = credentials.quota_owner();
+        if current.quota_owner() != owner
+            || (!owner.is_known() && current.authorization != credentials.authorization)
+        {
             bail!("account identity changed; refresh before using a reset");
         }
+        let request_generation = self
+            .router
+            .reset_generation_for_owner(account_name, &owner)
+            .await
+            .context("account identity changed; refresh before using a reset")?;
+        if !is_retry {
+            *action = Some(ResetAttempt {
+                owner: owner.clone(),
+                bearer_fingerprint: blake3::hash(credentials.authorization.as_bytes()),
+                credit_id: credit_id.into(),
+                request_id: request_id.into(),
+                quota_generation: request_generation,
+                result: None,
+            });
+        }
+        let attempt = action.as_mut().expect("reset attempt was reserved");
         self.router
             .observe_reset_credits_for_owner(account_name, None, &credentials.quota_owner())
             .await;
@@ -164,11 +221,23 @@ impl App {
         let mut result: ResetResult = serde_json::from_slice(&bytes).context(
             "reset outcome unknown; refresh credits before retrying with the same request ID",
         )?;
-        if result.code == ResetOutcome::Reset {
+        if result.code == ResetOutcome::Reset
+            || (is_retry && result.code == ResetOutcome::AlreadyRedeemed)
+        {
+            // A fresh reset happened during this POST. An idempotent replay only
+            // confirms the original attempt and cannot erase intervening failures.
+            let generation = if result.code == ResetOutcome::Reset {
+                request_generation
+            } else {
+                attempt.quota_generation
+            };
             self.router
-                .confirm_reset_for_owner(account_name, &credentials.quota_owner())
+                .confirm_reset_for_owner(account_name, &owner, generation)
                 .await;
         }
+        // Retain the confirmed outcome even if the following refresh is interrupted
+        // or the local client loses this response. A replay must not clear later quota.
+        attempt.result = Some(result.clone());
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let refreshed = tokio::time::timeout(
             USAGE_FETCH_ACCOUNT_TIMEOUT,
@@ -180,6 +249,7 @@ impl App {
         if let Err(error) = refreshed {
             result.refresh_error = Some(format!("{error:#}"));
         }
+        attempt.result = Some(result.clone());
         Ok(result)
     }
 }

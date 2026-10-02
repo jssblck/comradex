@@ -796,7 +796,7 @@ pub struct App {
     live_calls: LiveCallStore,
     auth: auth::Resolver,
     usage_url: Uri,
-    usage_locks: HashMap<String, AsyncMutex<()>>,
+    usage_locks: HashMap<String, AsyncMutex<Option<reset_credits::ResetAttempt>>>,
     usage_activation: AsyncMutex<Result<crate::usage_activation::UsageActivationLedger>>,
     file_owners: Arc<AffinityStore>,
     context_store: context_store::ContextStore,
@@ -862,7 +862,7 @@ impl App {
             usage_locks: config
                 .accounts
                 .keys()
-                .map(|name| (name.clone(), AsyncMutex::new(())))
+                .map(|name| (name.clone(), AsyncMutex::new(None)))
                 .collect(),
             usage_activation: AsyncMutex::new(
                 crate::usage_activation::UsageActivationLedger::open(

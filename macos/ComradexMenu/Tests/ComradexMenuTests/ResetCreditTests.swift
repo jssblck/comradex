@@ -96,14 +96,68 @@ final class ResetCreditTests: XCTestCase {
             XCTAssertTrue(ResetResultSnapshot(code: code, refreshError: nil).message.contains(text))
         }
     }
+
+    @MainActor
+    func testUncertainResetRemainsRetryableWhenRefreshRemovesCredit() async throws {
+        for reportsCredits in [true, false] {
+            let snapshot = try resetFixture()
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(snapshot)) as? [String: Any])
+            var accounts = try XCTUnwrap(json["accounts"] as? [[String: Any]])
+            if reportsCredits {
+                accounts[0]["reset_credits"] = ["available_count": 0, "observed_at_unix": 1790900000, "credits": []] as [String: Any]
+            } else {
+                accounts[0]["reset_credits"] = NSNull()
+            }
+            json["accounts"] = accounts
+            let consumed = try JSONDecoder().decode(UIStatusSnapshot.self, from: JSONSerialization.data(withJSONObject: json))
+            let client = ResetRecordingClient(snapshot: snapshot, afterFailureSnapshot: consumed)
+            let store = ComradexStore(client: client)
+            await store.refresh()
+            await store.useResetCredit(account: "personal", creditID: "one")
+            XCTAssertNotNil(store.pendingResetCredits["personal"]?["one"])
+            let initialCalls = await client.calls
+            XCTAssertEqual(initialCalls.count, 1)
+
+            let controller = MenuBarController(store: store)
+            controller.rebuildMenu()
+            let row = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("personal ·") })
+            let menuTitle = reportsCredits ? "0 resets available" : "Reset confirmation pending"
+            let resets = try XCTUnwrap(row.submenu?.items.first { $0.title == menuTitle }?.submenu)
+            let retry = try XCTUnwrap(resets.items.first { $0.title.hasPrefix("Retry Full reset ·") })
+            XCTAssertTrue(retry.isEnabled)
+            XCTAssertNil(retry.submenu)
+            XCTAssertEqual(retry.action, NSSelectorFromString("useResetSelected:"))
+            let credit = try XCTUnwrap(store.pendingResetCredits["personal"]?["one"])
+            let alert = MenuBarController.resetConfirmation(account: "personal", credit: credit, isRetry: true)
+            XCTAssertEqual(alert.buttons.first?.title, "Cancel")
+            XCTAssertEqual(alert.buttons.last?.title, "Retry Reset")
+
+            await store.useResetCredit(account: "personal", creditID: "one")
+            let calls = await client.calls
+            XCTAssertEqual(calls.count, 2)
+            XCTAssertEqual(calls[0].requestID, calls[1].requestID)
+            XCTAssertEqual(calls[0].creditID, calls[1].creditID)
+            XCTAssertNil(store.pendingResetCredits["personal"]?["one"])
+            controller.rebuildMenu()
+            let updatedRow = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("personal ·") })
+            let updatedResets = updatedRow.submenu?.items.first { $0.title == menuTitle }?.submenu
+            XCTAssertFalse(updatedResets?.items.contains { $0.title.hasPrefix("Retry ") } ?? false)
+        }
+    }
 }
 
 private actor ResetRecordingClient: ControlServing {
     struct Call: Sendable { let account: String; let creditID: String; let requestID: String }
     let snapshot: UIStatusSnapshot
+    let afterFailureSnapshot: UIStatusSnapshot?
     var calls: [Call] = []
-    init(snapshot: UIStatusSnapshot) { self.snapshot = snapshot }
-    func status() async throws -> UIStatusSnapshot { snapshot }
+    init(snapshot: UIStatusSnapshot, afterFailureSnapshot: UIStatusSnapshot? = nil) {
+        self.snapshot = snapshot
+        self.afterFailureSnapshot = afterFailureSnapshot
+    }
+    func status() async throws -> UIStatusSnapshot {
+        calls.isEmpty ? snapshot : (afterFailureSnapshot ?? snapshot)
+    }
     func useResetCredit(account: String, creditID: String, requestID: String) async throws -> ResetResultSnapshot {
         calls.append(Call(account: account, creditID: creditID, requestID: requestID))
         if calls.count == 1 { throw ControlSocketError.emptyResponse }

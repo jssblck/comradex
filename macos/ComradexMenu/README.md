@@ -10,6 +10,8 @@ Each account opens a submenu with three choices: Automatic — quota-aware selec
 
 When the backend reports reset credits, the account submenu includes **N resets available**. Expanding it lists available credits with their full expiration timestamps (including seconds, fractional seconds, and timezone offset supplied by the server). Clicking a credit directly opens a confirmation naming the account and selected credit, with Cancel as the default. Expired or unavailable credits are omitted; unsupported credits are disabled. Ordinary refreshes never consume credits. After a reset, the app shows the backend outcome and refreshed status; ambiguous failures retain the request ID for a retry against the same credit.
 
+An uncertain attempt stays in that list as **Retry…**, even if a refresh removes the consumed credit. Clicking it confirms a retry of the original request. Once confirmed, the retry item is removed. Retries never happen automatically.
+
 The app starts directly as an AppKit menu-bar application without creating a Settings window.
 
 Sign In… appears within the submenu when authentication or renewal is needed; it does not change routing. During this app's login flow, Continue Sign In… reopens the same login window. The window distinguishes requesting a code from waiting for authorization, shows the selectable code, and provides Copy Code and browser controls. Starting another attempt clears the previous code. Inbound accounts offer Connect existing Codex login… in the submenu.

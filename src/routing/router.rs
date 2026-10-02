@@ -126,6 +126,7 @@ pub struct QuotaWindowStatus {
 
 #[derive(Debug, Default)]
 struct AccountRuntime {
+    quota_failure_generation: u64,
     quota_owner: Option<QuotaOwner>,
     reauth_required: bool,
     bearer_unusable: bool,
@@ -286,6 +287,7 @@ impl Router {
             runtime.usage_updated_at_unix = None;
             runtime.usage_windows.clear();
             runtime.reset_credits = None;
+            runtime.quota_failure_generation = runtime.quota_failure_generation.wrapping_add(1);
             runtime.quota_owner = None;
         }
     }
@@ -962,6 +964,7 @@ impl Router {
                 chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX),
             );
             a.quota_evidence = (!evidence.is_empty()).then_some(evidence);
+            a.quota_failure_generation = a.quota_failure_generation.wrapping_add(1);
         }
     }
     pub async fn soft_failure(&self, account: &str) {
@@ -1140,11 +1143,28 @@ impl Router {
         }
     }
 
-    /// A confirmed manual reset invalidates prior quota evidence even if the
-    /// backend keeps the same window deadline. A failed refresh must not retain it.
-    pub async fn confirm_reset_for_owner(&self, account: &str, owner: &QuotaOwner) {
+    pub async fn reset_generation_for_owner(
+        &self,
+        account: &str,
+        owner: &QuotaOwner,
+    ) -> Option<u64> {
+        let mut accounts = self.accounts.lock().await;
+        let runtime = accounts.get_mut(account)?;
+        self.accepts_quota_owner(account, runtime, owner)
+            .then_some(runtime.quota_failure_generation)
+    }
+
+    /// A confirmed manual reset invalidates pre-request evidence even when its
+    /// deadline is unchanged. A delayed confirmation must not clear a newer 429.
+    pub async fn confirm_reset_for_owner(
+        &self,
+        account: &str,
+        owner: &QuotaOwner,
+        generation: u64,
+    ) {
         if let Some(runtime) = self.accounts.lock().await.get_mut(account)
             && self.accepts_quota_owner(account, runtime, owner)
+            && runtime.quota_failure_generation == generation
         {
             runtime.quota_until = None;
             runtime.quota_reset_at = None;

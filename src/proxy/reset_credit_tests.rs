@@ -84,13 +84,36 @@ async fn reset_credit_fixture(
                         let response = match path.as_str() {
                             "/backend-api/wham/rate-limit-reset-credits/consume" => {
                                 assert_eq!(method, Method::POST);
+                                if outcome == "failed_before_consumption"
+                                    && recorded
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .filter(|(method, _, _)| *method == Method::POST)
+                                        .count()
+                                        == 1
+                                {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionAborted,
+                                        "fixture failed before consuming the credit",
+                                    ));
+                                }
+                                if matches!(outcome, "lost_response" | "lost_missing_credit") {
+                                    consumed.store(true, Ordering::SeqCst);
+                                    if !already_consumed {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::ConnectionAborted,
+                                            "fixture consumed the credit but lost its response",
+                                        ));
+                                    }
+                                }
                                 if outcome == "http_error" {
                                     status = StatusCode::INTERNAL_SERVER_ERROR;
                                 }
-                                let code = if outcome == "refresh_error" {
-                                    "reset"
-                                } else {
-                                    outcome
+                                let code = match outcome {
+                                    "refresh_error" | "failed_before_consumption" => "reset",
+                                    "lost_response" | "lost_missing_credit" => "already_redeemed",
+                                    _ => outcome,
                                 };
                                 if code == "reset" || code == "already_redeemed" {
                                     consumed.store(true, Ordering::SeqCst);
@@ -116,21 +139,28 @@ async fn reset_credit_fixture(
                                 if outcome == "details_error" {
                                     status = StatusCode::SERVICE_UNAVAILABLE;
                                 }
-                                serde_json::json!({
-                                    "available_count": available_count,
-                                    "credits": [{
+                                let credits = if already_consumed
+                                    && outcome == "lost_missing_credit"
+                                {
+                                    serde_json::json!([])
+                                } else {
+                                    serde_json::json!([{
                                         "id": "credit-one",
                                         "reset_type": "codex_rate_limits",
                                         "status": if already_consumed { "consumed" } else { "available" },
                                         "granted_at": "2026-10-01T01:02:03.456Z",
                                         "expires_at": expiry,
                                         "title": "Full reset"
-                                    }]
+                                    }])
+                                };
+                                serde_json::json!({
+                                    "available_count": available_count,
+                                    "credits": credits
                                 })
                             }
                             _ => panic!("unexpected fixture request: {path}"),
                         };
-                        Ok::<_, Infallible>(
+                        Ok::<_, std::io::Error>(
                             Response::builder()
                                 .status(status)
                                 .body(Full::new(Bytes::from(response.to_string())))
@@ -371,4 +401,209 @@ async fn reset_credit_cannot_race_an_in_progress_usage_refresh() {
             .contains("in progress")
     );
     assert!(fixture.calls.lock().unwrap().is_empty());
+}
+
+async fn mark_reset_credit_fixture_exhausted(fixture: &ResetCreditFixture) {
+    let mut exhausted = hyper::HeaderMap::new();
+    exhausted.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+    exhausted.insert("x-codex-primary-reset-at", "4102444800".parse().unwrap());
+    fixture.router.quota_failure("a", &exhausted).await;
+    assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+}
+
+#[tokio::test]
+async fn reset_credit_lost_response_reconciles_consumed_or_missing_credit() {
+    for outcome in ["lost_response", "lost_missing_credit"] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = reset_credit_fixture(dir.path(), outcome, "2100-01-01T00:00:00Z").await;
+        mark_reset_credit_fixture_exhausted(&fixture).await;
+        assert!(
+            fixture
+                .app
+                .use_reset_credit("a", "credit-one", "original-request")
+                .await
+                .is_err()
+        );
+
+        // Ordinary polling sees the consumed credit and recovered usage, but the
+        // unchanged deadline cannot release the original hard quota block.
+        assert_eq!(
+            fixture
+                .app
+                .read_reset_credits("a")
+                .await
+                .unwrap()
+                .available_count,
+            0
+        );
+        assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _, _)| *method == Method::POST)
+                .count(),
+            1
+        );
+
+        let result = fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .unwrap();
+        assert_eq!(
+            result.code,
+            crate::reset_credits::ResetOutcome::AlreadyRedeemed
+        );
+        assert!(fixture.router.routing_snapshot().await.account_states["a"].available);
+        let posts: Vec<_> = fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| *method == Method::POST)
+            .map(|(_, _, body)| body.clone())
+            .collect();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0], posts[1]);
+
+        // A local response can also be lost. Replaying a confirmed result must
+        // neither POST again nor erase quota exhaustion observed after success.
+        mark_reset_credit_fixture_exhausted(&fixture).await;
+        let cached = fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .unwrap();
+        assert_eq!(
+            cached.code,
+            crate::reset_credits::ResetOutcome::AlreadyRedeemed
+        );
+        assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _, _)| *method == Method::POST)
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn reset_credit_late_confirmation_preserves_newer_quota_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "lost_response", "2100-01-01T00:00:00Z").await;
+    mark_reset_credit_fixture_exhausted(&fixture).await;
+    assert!(
+        fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .is_err()
+    );
+    mark_reset_credit_fixture_exhausted(&fixture).await;
+    let result = fixture
+        .app
+        .use_reset_credit("a", "credit-one", "original-request")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.code,
+        crate::reset_credits::ResetOutcome::AlreadyRedeemed
+    );
+    assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+}
+
+#[tokio::test]
+async fn reset_credit_retry_that_performs_reset_clears_intervening_quota_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(
+        dir.path(),
+        "failed_before_consumption",
+        "2100-01-01T00:00:00Z",
+    )
+    .await;
+    mark_reset_credit_fixture_exhausted(&fixture).await;
+    assert!(
+        fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .is_err()
+    );
+    mark_reset_credit_fixture_exhausted(&fixture).await;
+    let result = fixture
+        .app
+        .use_reset_credit("a", "credit-one", "original-request")
+        .await
+        .unwrap();
+    assert_eq!(result.code, crate::reset_credits::ResetOutcome::Reset);
+    assert!(fixture.router.routing_snapshot().await.account_states["a"].available);
+    let posts: Vec<_> = fixture
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _, _)| *method == Method::POST)
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[0], posts[1]);
+}
+
+#[tokio::test]
+async fn reset_credit_retry_cannot_change_request_credit_or_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "lost_response", "2100-01-01T00:00:00Z").await;
+    assert!(
+        fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .is_err()
+    );
+    for (credit, request) in [
+        ("credit-other", "original-request"),
+        ("credit-one", "new-request"),
+    ] {
+        assert!(
+            fixture
+                .app
+                .use_reset_credit("a", credit, request)
+                .await
+                .is_err()
+        );
+    }
+    let auth_path = fixture.home.join("auth.json");
+    let mut auth: serde_json::Value =
+        serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
+    auth["tokens"]["account_id"] = "replacement-workspace".into();
+    auth["tokens"]["access_token"] = reset_credit_token("replacement-workspace").into();
+    fs::write(auth_path, serde_json::to_vec(&auth).unwrap()).unwrap();
+    let error = fixture
+        .app
+        .use_reset_credit("a", "credit-one", "original-request")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("original account identity and credit")
+    );
+    assert_eq!(
+        fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| *method == Method::POST)
+            .count(),
+        1
+    );
 }

@@ -12,6 +12,7 @@ final class ComradexStore: ObservableObject {
     @Published private(set) var resettingAccount: String?
     @Published private(set) var resetMessage: String?
     @Published private(set) var resetDetail: String?
+    @Published private(set) var pendingResetCredits: [String: [String: ResetCreditSnapshot]] = [:]
     private var resetRequestIDs: [String: String] = [:]
     @Published private(set) var errorMessage: String?
     @Published private(set) var actionErrorMessage: String?
@@ -101,6 +102,8 @@ final class ComradexStore: ObservableObject {
         guard resettingAccount == nil, updatingPool == nil, connectingAccount == nil, !isLoginRunning else { return }
         let key = "\(account)\n\(creditID)"
         let requestID = resetRequestIDs[key] ?? UUID().uuidString
+        let selectedCredit = pendingResetCredits[account]?[creditID]
+            ?? snapshot?.accounts.first(where: { $0.name == account })?.resetCredits?.credits?.first(where: { $0.id == creditID })
         resetRequestIDs[key] = requestID
         resettingAccount = account
         resetMessage = nil
@@ -111,12 +114,14 @@ final class ComradexStore: ObservableObject {
         do {
             let result = try await client.useResetCredit(account: account, creditID: creditID, requestID: requestID)
             resetRequestIDs[key] = nil
+            pendingResetCredits[account]?[creditID] = nil
             resetMessage = "\(account): \(result.message)"
             if let error = result.refreshError {
                 resetDetail = "Usage refresh failed: \(error)"
             }
         } catch {
-            resetMessage = "Reset not confirmed for \(account) — Refresh to check"
+            if let selectedCredit { pendingResetCredits[account, default: [:]][creditID] = selectedCredit }
+            resetMessage = "Reset not confirmed for \(account) — retry from its reset menu"
             resetDetail = "\(error.localizedDescription) Request ID: \(requestID)"
         }
         await readStatus(generation: statusGeneration)
