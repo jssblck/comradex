@@ -107,6 +107,8 @@ pub struct AccountRoutingStatus {
     pub quota_windows: BTreeMap<String, QuotaWindowStatus>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usage_windows: BTreeMap<String, QuotaWindowStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
     /// Soft preference for fresh admissions only; the account remains available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_backoff_until_unix: Option<i64>,
@@ -130,6 +132,7 @@ struct AccountRuntime {
     usage: Option<u8>,
     usage_updated_at_unix: Option<i64>,
     usage_windows: BTreeMap<String, QuotaWindowStatus>,
+    reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
     inflight: u64,
     last_assigned: u64,
     needs_login: bool,
@@ -245,7 +248,8 @@ impl Router {
                 && (runtime.quota_until.is_some()
                     || runtime.quota_evidence.is_some()
                     || runtime.usage.is_some()
-                    || !runtime.usage_windows.is_empty())
+                    || !runtime.usage_windows.is_empty()
+                    || runtime.reset_credits.is_some())
             {
                 self.reconcile_quota_owner(name, runtime);
             }
@@ -281,6 +285,7 @@ impl Router {
             runtime.usage = None;
             runtime.usage_updated_at_unix = None;
             runtime.usage_windows.clear();
+            runtime.reset_credits = None;
             runtime.quota_owner = None;
         }
     }
@@ -1122,6 +1127,34 @@ impl Router {
             }
         }
     }
+    pub async fn observe_reset_credits_for_owner(
+        &self,
+        account: &str,
+        snapshot: Option<crate::reset_credits::ResetCreditsSnapshot>,
+        owner: &QuotaOwner,
+    ) {
+        if let Some(runtime) = self.accounts.lock().await.get_mut(account)
+            && self.accepts_quota_owner(account, runtime, owner)
+        {
+            runtime.reset_credits = snapshot;
+        }
+    }
+
+    /// A confirmed manual reset invalidates prior quota evidence even if the
+    /// backend keeps the same window deadline. A failed refresh must not retain it.
+    pub async fn confirm_reset_for_owner(&self, account: &str, owner: &QuotaOwner) {
+        if let Some(runtime) = self.accounts.lock().await.get_mut(account)
+            && self.accepts_quota_owner(account, runtime, owner)
+        {
+            runtime.quota_until = None;
+            runtime.quota_reset_at = None;
+            runtime.quota_evidence = None;
+            runtime.usage = None;
+            runtime.usage_updated_at_unix = None;
+            runtime.usage_windows.clear();
+        }
+    }
+
     pub async fn record_count(&self) -> usize {
         self.accounts.lock().await.len()
     }
@@ -1224,6 +1257,7 @@ fn account_routing_status(
         inflight: runtime.inflight,
         quota_windows,
         usage_windows: runtime.usage_windows.clone(),
+        reset_credits: runtime.reset_credits.clone(),
         capacity_backoff_until_unix: runtime.capacity.until.filter(|until| *until > now).map(
             |until| {
                 wall_now.timestamp()
@@ -1586,6 +1620,7 @@ mod tests {
         let pool = &cfg.pools["default"];
         // A usage poll reports b's weekly window fully used before any upstream rejection.
         let snapshot = crate::usage::UsageSnapshot {
+            reset_credits_available: None,
             observed_at_unix: Utc::now().timestamp(),
             windows: BTreeMap::from([(
                 "secondary".into(),

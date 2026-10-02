@@ -69,6 +69,15 @@ enum Request {
     },
     UiStatus,
     UiRefreshUsage,
+    UiResetCredits {
+        account: String,
+    },
+    UiUseResetCredit {
+        account: String,
+        credit_id: String,
+        request_id: String,
+        confirm: bool,
+    },
     UiSetAccountRole {
         pool: String,
         account: String,
@@ -99,6 +108,8 @@ impl Request {
             | Self::RoutingStatus { secret } => Some(secret),
             Self::UiStatus
             | Self::UiRefreshUsage
+            | Self::UiResetCredits { .. }
+            | Self::UiUseResetCredit { .. }
             | Self::UiSetAccountRole { .. }
             | Self::UiSetPreferred { .. }
             | Self::UiStartLogin { .. }
@@ -119,6 +130,10 @@ struct Response {
     status: Option<UiStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     login: Option<UiLoginStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_result: Option<crate::reset_credits::ResetResult>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,6 +162,8 @@ pub struct UiAccountStatus {
     pub usage_updated_at_unix: Option<i64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usage_windows: BTreeMap<String, crate::routing::QuotaWindowStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -543,6 +560,7 @@ impl Drop for SocketGuard {
 }
 
 struct ConfigChanges {
+    app: Option<Arc<crate::proxy::App>>,
     edit_lock: Mutex<()>,
     reload: Arc<Notify>,
     usage_refresh: Arc<Notify>,
@@ -591,12 +609,20 @@ impl ControlServer {
             stats,
             login_manager,
             changes: Arc::new(ConfigChanges {
+                app: None,
                 edit_lock: Mutex::new(()),
                 reload: Arc::new(Notify::new()),
                 usage_refresh: Arc::new(Notify::new()),
             }),
             clients: Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS)),
         })
+    }
+
+    pub fn with_app(mut self, app: Arc<crate::proxy::App>) -> Self {
+        Arc::get_mut(&mut self.changes)
+            .expect("server has not started")
+            .app = Some(app);
+        self
     }
 
     pub fn reload_requested(&self) -> Arc<Notify> {
@@ -698,6 +724,8 @@ async fn handle(
             routing: None,
             status: None,
             login: None,
+            reset_credits: None,
+            reset_result: None,
         }
     } else {
         match serde_json::from_slice::<Request>(&bytes) {
@@ -713,7 +741,7 @@ async fn handle(
                     &router,
                     &stats,
                     &login_manager,
-                    &changes.edit_lock,
+                    &changes,
                 )
                 .await
             }
@@ -723,6 +751,8 @@ async fn handle(
                 routing: None,
                 status: None,
                 login: None,
+                reset_credits: None,
+                reset_result: None,
             },
         }
     };
@@ -754,8 +784,9 @@ async fn process(
     router: &Router,
     stats: &Stats,
     login_manager: &LoginManager,
-    edit_lock: &Mutex<()>,
+    changes: &ConfigChanges,
 ) -> Response {
+    let edit_lock = &changes.edit_lock;
     if let Some(secret) = request.secret()
         && !secrets_equal(secret, &config.proxy.installation_secret)
     {
@@ -789,6 +820,37 @@ async fn process(
                 )
                 .await?;
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
+            }
+            Request::UiResetCredits { account } => {
+                let app = changes
+                    .app
+                    .as_ref()
+                    .context("reset credit service unavailable")?;
+                let credits = app.read_reset_credits(&account).await?;
+                let mut response = Response::routing(router.routing_snapshot().await);
+                response.reset_credits = Some(credits);
+                response
+            }
+            Request::UiUseResetCredit {
+                account,
+                credit_id,
+                request_id,
+                confirm,
+            } => {
+                if !confirm {
+                    bail!("explicit confirmation is required to consume a reset credit");
+                }
+                let app = changes
+                    .app
+                    .as_ref()
+                    .context("reset credit service unavailable")?;
+                let result = app
+                    .use_reset_credit(&account, &credit_id, &request_id)
+                    .await?;
+                let mut response =
+                    Response::status(build_ui_status(config, router, stats, login_manager).await);
+                response.reset_result = Some(result);
+                response
             }
             Request::UiStatus | Request::UiRefreshUsage => {
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
@@ -828,6 +890,8 @@ impl Response {
             routing: None,
             status: None,
             login: None,
+            reset_credits: None,
+            reset_result: None,
         }
     }
 
@@ -838,6 +902,8 @@ impl Response {
             routing: Some(routing),
             status: None,
             login: None,
+            reset_credits: None,
+            reset_result: None,
         }
     }
 
@@ -848,6 +914,8 @@ impl Response {
             routing: None,
             status: Some(status),
             login: None,
+            reset_credits: None,
+            reset_result: None,
         }
     }
 
@@ -858,6 +926,8 @@ impl Response {
             routing: None,
             status: None,
             login: Some(login),
+            reset_credits: None,
+            reset_result: None,
         }
     }
 }
@@ -1049,6 +1119,10 @@ async fn build_ui_status(
                     .account_states
                     .get(name)
                     .and_then(|state| state.usage_updated_at_unix),
+                reset_credits: routing
+                    .account_states
+                    .get(name)
+                    .and_then(|state| state.reset_credits.clone()),
                 usage_windows: routing
                     .account_states
                     .get(name)
@@ -1163,11 +1237,58 @@ pub fn routing_status(state_dir: &Path, secret: &str) -> Result<RoutingSnapshot>
     )
 }
 
+pub fn read_reset_credits(
+    state_dir: &Path,
+    account: &str,
+) -> Result<crate::reset_credits::ResetCreditsSnapshot> {
+    send_response(
+        state_dir,
+        &Request::UiResetCredits {
+            account: account.into(),
+        },
+    )?
+    .reset_credits
+    .context("control response omitted reset credits")
+}
+
+pub fn use_reset_credit(
+    state_dir: &Path,
+    account: &str,
+    credit_id: &str,
+    request_id: &str,
+) -> Result<crate::reset_credits::ResetResult> {
+    send_response(
+        state_dir,
+        &Request::UiUseResetCredit {
+            account: account.into(),
+            credit_id: credit_id.into(),
+            request_id: request_id.into(),
+            confirm: true,
+        },
+    )?
+    .reset_result
+    .context("control response omitted reset result")
+}
+
 fn send(state_dir: &Path, request: &Request) -> Result<RoutingSnapshot> {
+    send_response(state_dir, request)?
+        .routing
+        .context("control response omitted routing status")
+}
+
+fn send_response(state_dir: &Path, request: &Request) -> Result<Response> {
     let path = socket_path(state_dir);
     let mut stream = StdUnixStream::connect(&path)
         .with_context(|| format!("connect to running daemon at {}", path.display()))?;
-    stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
+    let timeout = if matches!(
+        request,
+        Request::UiResetCredits { .. } | Request::UiUseResetCredit { .. }
+    ) {
+        Duration::from_secs(120)
+    } else {
+        CLIENT_TIMEOUT
+    };
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
@@ -1183,9 +1304,7 @@ fn send(state_dir: &Path, request: &Request) -> Result<RoutingSnapshot> {
                 .unwrap_or_else(|| "control request failed".into())
         )
     }
-    response
-        .routing
-        .context("control response omitted routing status")
+    Ok(response)
 }
 
 #[cfg(test)]

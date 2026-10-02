@@ -201,6 +201,7 @@ fn quota_identity_headers(used: u8, reset: i64) -> hyper::HeaderMap {
 
 fn quota_identity_snapshot(used: u8, reset: i64) -> usage::UsageSnapshot {
     usage::UsageSnapshot {
+        reset_credits_available: None,
         observed_at_unix: chrono::Utc::now().timestamp(),
         windows: BTreeMap::from([(
             "primary".into(),

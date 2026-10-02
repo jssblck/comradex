@@ -60,6 +60,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     let usagePercent: Int?
     let usageUpdatedAtUnix: Int64?
     let usageWindows: [String: UsageWindowSnapshot]
+    let resetCredits: ResetCreditsSnapshot?
 
     var id: String { name }
     var isSignedIn: Bool {
@@ -90,6 +91,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
         case usagePercent = "usage_percent"
         case usageUpdatedAtUnix = "usage_updated_at_unix"
         case usageWindows = "usage_windows"
+        case resetCredits = "reset_credits"
     }
 
     init(from decoder: Decoder) throws {
@@ -106,6 +108,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
         usagePercent = try container.decodeIfPresent(Int.self, forKey: .usagePercent)
         usageUpdatedAtUnix = try container.decodeIfPresent(Int64.self, forKey: .usageUpdatedAtUnix)
         usageWindows = try container.decodeIfPresent([String: UsageWindowSnapshot].self, forKey: .usageWindows) ?? [:]
+        resetCredits = try container.decodeIfPresent(ResetCreditsSnapshot.self, forKey: .resetCredits)
     }
 }
 
@@ -252,5 +255,77 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
               url.host?.lowercased() == "auth.openai.com"
         else { return URL(string: "https://auth.openai.com/codex/device")! }
         return url
+    }
+}
+
+struct ResetCreditsSnapshot: Codable, Equatable, Sendable {
+    let availableCount: Int
+    let observedAtUnix: Int64
+    let credits: [ResetCreditSnapshot]?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case availableCount = "available_count"
+        case observedAtUnix = "observed_at_unix"
+        case credits, error
+    }
+
+    func availableCount(at now: Date = Date()) -> Int {
+        credits.map { $0.filter { $0.isAvailable(at: now) }.count } ?? availableCount
+    }
+}
+
+struct ResetCreditSnapshot: Codable, Equatable, Sendable {
+    let id: String
+    let resetType: String
+    let status: String
+    let grantedAt: String
+    let expiresAt: String?
+    let title: String?
+    let description: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, status, title, description
+        case resetType = "reset_type"
+        case grantedAt = "granted_at"
+        case expiresAt = "expires_at"
+    }
+
+    var displayTitle: String { title ?? (resetType == "codex_rate_limits" ? "Full reset" : resetType) }
+    // Show the original timestamp, including fractional seconds and UTC offset.
+    var expiryDescription: String { expiresAt.map { "Expires \($0)" } ?? "No expiration" }
+
+    func isAvailable(at now: Date = Date()) -> Bool {
+        guard status == "available" else { return false }
+        guard let expiresAt else { return true }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let expiry = formatter.date(from: expiresAt) { return expiry > now }
+        formatter.formatOptions = [.withInternetDateTime]
+        guard let expiry = formatter.date(from: expiresAt) else { return false }
+        return expiry > now
+    }
+
+    func canRedeem(at now: Date = Date()) -> Bool {
+        resetType == "codex_rate_limits" && isAvailable(at: now)
+    }
+}
+
+struct ResetResultSnapshot: Decodable, Sendable {
+    let code: String
+    let refreshError: String?
+    enum CodingKeys: String, CodingKey {
+        case code
+        case refreshError = "refresh_error"
+    }
+
+    var message: String {
+        switch code {
+        case "reset": return "Reset used successfully."
+        case "already_redeemed": return "This reset request already succeeded."
+        case "nothing_to_reset": return "No eligible usage window to reset. No credit used."
+        case "no_credit": return "No reset credit available."
+        default: return "Unknown reset result. Refresh before trying again."
+        }
     }
 }
