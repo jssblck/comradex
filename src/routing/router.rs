@@ -130,7 +130,8 @@ struct AccountRuntime {
     quota_owner: Option<QuotaOwner>,
     reauth_required: bool,
     bearer_unusable: bool,
-    usage: Option<u8>,
+    /// Legacy aggregate header without a named quota window or reset deadline.
+    legacy_usage: Option<u8>,
     usage_updated_at_unix: Option<i64>,
     usage_windows: BTreeMap<String, QuotaWindowStatus>,
     reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
@@ -228,10 +229,24 @@ impl AccountRuntime {
         self.needs_login || self.bearer_unusable
     }
 
-    /// Usage reports an account-wide window as fully consumed. Upstream has not
-    /// necessarily rejected it yet, so it stays a last resort rather than ineligible.
-    fn fully_used(&self) -> bool {
-        self.usage.is_some_and(|usage| usage >= 100)
+    fn usage_at(&self, now: DateTime<Utc>) -> Option<u8> {
+        self.usage_windows
+            .values()
+            .filter(|window| {
+                window
+                    .reset_at_unix
+                    .is_none_or(|reset| reset > now.timestamp())
+            })
+            .filter_map(|window| window.used_percent)
+            .chain(self.legacy_usage)
+            .max()
+    }
+
+    /// Credits can keep upstream requests succeeding after included quota is spent.
+    /// Enforce reported exhaustion before dispatch, without waiting for a rejection.
+    fn quota_blocked(&self, now: Instant, wall_now: DateTime<Utc>) -> bool {
+        self.quota_until.is_some_and(|until| until > now)
+            || self.usage_at(wall_now).is_some_and(|usage| usage >= 100)
     }
 }
 
@@ -248,7 +263,7 @@ impl Router {
                 .is_some_and(QuotaOwner::is_known)
                 && (runtime.quota_until.is_some()
                     || runtime.quota_evidence.is_some()
-                    || runtime.usage.is_some()
+                    || runtime.legacy_usage.is_some()
                     || !runtime.usage_windows.is_empty()
                     || runtime.reset_credits.is_some())
             {
@@ -283,7 +298,7 @@ impl Router {
             runtime.quota_until = None;
             runtime.quota_reset_at = None;
             runtime.quota_evidence = None;
-            runtime.usage = None;
+            runtime.legacy_usage = None;
             runtime.usage_updated_at_unix = None;
             runtime.usage_windows.clear();
             runtime.reset_credits = None;
@@ -429,10 +444,9 @@ impl Router {
                     binding_epoch == Some(binding.account_generation)
                         && !a.auth_unavailable()
                         && !a.login_in_progress
-                        && a.quota_until.is_none_or(|v| v <= now)
                         // Keep warm cohorts past the soft switch threshold, but
-                        // let fully consumed usage fall through to a fresh pick.
-                        && a.usage.is_none_or(|usage| usage < 100)
+                        // leave accounts whose included quota is exhausted.
+                        && !a.quota_blocked(now, wall_now)
                 });
             if eligible {
                 let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -453,14 +467,14 @@ impl Router {
                 && accounts.get(id).is_some_and(|a| {
                     !a.auth_unavailable()
                         && !a.login_in_progress
-                        && a.quota_until.is_none_or(|v| v <= now)
+                        && !a.quota_blocked(now, wall_now)
                         && a.avoid_until.is_none_or(|v| v <= now)
                 })
         };
         let has_unpreserved = pool
             .members
             .iter()
-            .any(|id| preserved.as_ref() != Some(id) && eligible(id) && !accounts[id].fully_used());
+            .any(|id| preserved.as_ref() != Some(id) && eligible(id));
         let eligible =
             |id: &str| eligible(id) && (!has_unpreserved || preserved.as_deref() != Some(id));
         // Apply the soft capacity preference only after normal eligibility. An
@@ -475,7 +489,7 @@ impl Router {
         let below_switch_at = |id: &str| {
             accounts
                 .get(id)
-                .and_then(|account| account.usage)
+                .and_then(|account| account.usage_at(wall_now))
                 .is_none_or(|usage| usage < self.switch_at)
         };
         let selected = configured_preferred
@@ -499,7 +513,7 @@ impl Router {
                     .filter(|id| eligible(id))
                     .min_by_key(|id| {
                         let a = &accounts[*id];
-                        let (tier, usage) = match a.usage {
+                        let (tier, usage) = match a.usage_at(wall_now) {
                             Some(usage) if usage < self.switch_at => (0u8, usage),
                             None => (1u8, 0),
                             Some(usage) => (2u8, usage),
@@ -671,6 +685,7 @@ impl Router {
         pool: &PoolConfig,
     ) -> Result<(), SelectionStaleReason> {
         let now = Instant::now();
+        let wall_now = Utc::now();
         // Snapshot runtime state without holding the mutex across affinity I/O below.
         struct RuntimeProbe {
             known: bool,
@@ -681,7 +696,6 @@ impl Router {
         }
         let probe = {
             let mut accounts = self.account_runtimes().await;
-            let wall_now = Utc::now();
             for runtime in accounts.values_mut() {
                 reconcile_runtime(runtime, now, wall_now);
             }
@@ -690,7 +704,7 @@ impl Router {
                     known: true,
                     needs_login: runtime.auth_unavailable(),
                     login_in_progress: runtime.login_in_progress,
-                    quota_blocked: runtime.quota_until.is_some_and(|until| until > now),
+                    quota_blocked: runtime.quota_blocked(now, wall_now),
                     avoid_blocked: runtime.avoid_until.is_some_and(|until| until > now),
                 },
                 None => RuntimeProbe {
@@ -767,9 +781,8 @@ impl Router {
                         && accounts.get(id).is_some_and(|runtime| {
                             !runtime.auth_unavailable()
                                 && !runtime.login_in_progress
-                                && runtime.quota_until.is_none_or(|until| until <= now)
+                                && !runtime.quota_blocked(now, wall_now)
                                 && runtime.avoid_until.is_none_or(|until| until <= now)
-                                && !runtime.fully_used()
                         })
                 });
                 if has_alternative {
@@ -786,7 +799,7 @@ impl Router {
                     accounts.get(&preferred_id).is_some_and(|runtime| {
                         !runtime.auth_unavailable()
                             && !runtime.login_in_progress
-                            && runtime.quota_until.is_none_or(|until| until <= now)
+                            && !runtime.quota_blocked(now, wall_now)
                             && runtime.avoid_until.is_none_or(|until| until <= now)
                             && (!runtime.capacity.active(now)
                                 || accounts
@@ -799,7 +812,7 @@ impl Router {
                         let accounts = self.account_runtimes().await;
                         accounts
                             .get(&preferred_id)
-                            .and_then(|runtime| runtime.usage)
+                            .and_then(|runtime| runtime.usage_at(wall_now))
                             .is_none_or(|usage| usage < self.switch_at)
                     };
                     if usage_ok {
@@ -837,7 +850,7 @@ impl Router {
                 (
                     runtime.auth_unavailable(),
                     runtime.login_in_progress,
-                    runtime.quota_until.is_some_and(|until| until > now),
+                    runtime.quota_blocked(now, wall_now),
                     runtime.avoid_until.is_some_and(|until| until > now),
                 )
             })
@@ -917,7 +930,7 @@ impl Router {
             && accounts.get(account).is_some_and(|a| {
                 !a.auth_unavailable()
                     && !a.login_in_progress
-                    && a.quota_until.is_none_or(|v| v <= now)
+                    && !a.quota_blocked(now, wall_now)
                     && a.avoid_until.is_none_or(|v| v <= now)
             });
         if !eligible {
@@ -1050,19 +1063,13 @@ impl Router {
         headers: &hyper::HeaderMap,
         owner: &QuotaOwner,
     ) {
-        let observed_evidence = quota_evidence(headers, Utc::now());
-        let candidates = [
-            "x-codex-primary-used-percent",
-            "x-ratelimit-primary-used-percent",
-            "x-codex-usage-percent",
-            "x-codex-secondary-used-percent",
-            "x-ratelimit-secondary-used-percent",
-        ];
-        let usage = candidates
-            .iter()
-            .filter_map(|name| headers.get(*name)?.to_str().ok()?.parse::<f32>().ok())
-            .max_by(|left, right| left.total_cmp(right))
-            .map(|v| v.clamp(0.0, 100.0) as u8);
+        let now = Utc::now();
+        let observed_evidence = quota_evidence(headers, now);
+        let usage = headers
+            .get("x-codex-usage-percent")
+            .and_then(|value| value.to_str().ok()?.parse::<f32>().ok())
+            .filter(|percent| percent.is_finite())
+            .map(|percent| percent.clamp(0.0, 100.0).round() as u8);
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
             if usage.is_none() && observed_evidence.is_empty() {
                 return;
@@ -1071,21 +1078,30 @@ impl Router {
                 return;
             }
             if let Some(usage) = usage {
-                a.usage = Some(usage);
-                a.usage_updated_at_unix = Some(Utc::now().timestamp());
+                a.legacy_usage = Some(usage);
             }
+            a.usage_updated_at_unix = Some(now.timestamp());
             for (window, evidence) in &observed_evidence {
-                a.usage_windows.insert(
-                    window.name().to_owned(),
-                    QuotaWindowStatus {
-                        used_percent: evidence
-                            .used_percent
-                            .map(|percent| percent.clamp(0.0, 100.0).round() as u8),
-                        reset_at_unix: evidence.reset_at.map(|reset_at| reset_at.timestamp()),
-                        limit_window_seconds: window_minutes(headers, *window)
-                            .and_then(|minutes| minutes.checked_mul(60)),
-                    },
-                );
+                let usage_window = a.usage_windows.entry(window.name().to_owned()).or_default();
+                // A partial header update must not erase another exhausted window
+                // or its known deadline. New usage cannot reuse an elapsed deadline.
+                if let Some(percent) = evidence.used_percent {
+                    usage_window.used_percent = Some(percent.clamp(0.0, 100.0).round() as u8);
+                    if usage_window
+                        .reset_at_unix
+                        .is_some_and(|reset| reset <= now.timestamp())
+                    {
+                        usage_window.reset_at_unix = None;
+                    }
+                }
+                if let Some(reset) = evidence.reset_at {
+                    usage_window.reset_at_unix = Some(reset.timestamp());
+                }
+                if let Some(seconds) =
+                    window_minutes(headers, *window).and_then(|minutes| minutes.checked_mul(60))
+                {
+                    usage_window.limit_window_seconds = Some(seconds);
+                }
             }
             if a.quota_evidence
                 .as_ref()
@@ -1098,9 +1114,8 @@ impl Router {
         }
     }
 
-    /// Replace the last observed usage view with an authoritative WHAM snapshot. This updates
-    /// fresh-work admission scores and status metadata without turning a reported 100% window
-    /// into a hard quota cooldown before upstream actually rejects a request.
+    /// Replace the last observed usage view with an authoritative WHAM snapshot.
+    /// Exhausted windows block dispatch independently of rejection-derived cooldowns.
     pub async fn observe_usage_snapshot_for_owner(
         &self,
         account: &str,
@@ -1112,11 +1127,7 @@ impl Router {
             if !self.accepts_quota_owner(account, runtime, owner) {
                 return;
             }
-            runtime.usage = snapshot
-                .windows
-                .values()
-                .filter_map(|window| window.used_percent)
-                .max();
+            runtime.legacy_usage = None;
             runtime.usage_updated_at_unix = Some(snapshot.observed_at_unix);
             runtime.usage_windows = snapshot.windows;
             if runtime
@@ -1169,7 +1180,7 @@ impl Router {
             runtime.quota_until = None;
             runtime.quota_reset_at = None;
             runtime.quota_evidence = None;
-            runtime.usage = None;
+            runtime.legacy_usage = None;
             runtime.usage_updated_at_unix = None;
             runtime.usage_windows.clear();
         }
@@ -1238,17 +1249,37 @@ fn account_routing_status(
         (Some("needs_login".to_owned()), runtime.needs_login_retry_at)
     } else if runtime.bearer_unusable {
         (Some("access_token_rejected".to_owned()), None)
-    } else if runtime.quota_until.is_some_and(|until| until > now) {
+    } else if runtime.quota_blocked(now, wall_now) {
         (Some("quota".to_owned()), runtime.quota_until)
     } else if runtime.avoid_until.is_some_and(|until| until > now) {
         (Some("temporary_failure".to_owned()), runtime.avoid_until)
     } else {
         (None, None)
     };
-    let retry_at_unix = retry_at.map(|deadline| {
+    let mut retry_at_unix = retry_at.map(|deadline| {
         wall_now.timestamp()
             + i64::try_from(deadline.saturating_duration_since(now).as_secs()).unwrap_or(i64::MAX)
     });
+    if unavailable_reason.as_deref() == Some("quota")
+        && runtime.usage_at(wall_now).is_some_and(|usage| usage >= 100)
+    {
+        // Every exhausted window must reset. An unknown deadline cannot promise a retry time.
+        let usage_reset = runtime
+            .usage_windows
+            .values()
+            .filter(|window| {
+                window.used_percent.is_some_and(|used| used >= 100)
+                    && window
+                        .reset_at_unix
+                        .is_none_or(|reset| reset > wall_now.timestamp())
+            })
+            .try_fold(0, |latest, window| Some(latest.max(window.reset_at_unix?)));
+        retry_at_unix = if runtime.legacy_usage.is_some_and(|usage| usage >= 100) {
+            None
+        } else {
+            usage_reset.map(|reset| reset.max(retry_at_unix.unwrap_or(0)))
+        };
+    }
     let quota_windows = runtime
         .quota_evidence
         .as_ref()
@@ -1272,7 +1303,13 @@ fn account_routing_status(
         available: unavailable_reason.is_none(),
         unavailable_reason,
         retry_at_unix,
-        usage_percent: runtime.usage,
+        // Preserve the last reported view for display, including elapsed windows.
+        usage_percent: runtime
+            .usage_windows
+            .values()
+            .filter_map(|window| window.used_percent)
+            .chain(runtime.legacy_usage)
+            .max(),
         usage_updated_at_unix: runtime.usage_updated_at_unix,
         inflight: runtime.inflight,
         quota_windows,
@@ -1346,6 +1383,7 @@ fn quota_evidence(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> QuotaEviden
                 .get(&header)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse::<f32>().ok())
+                .filter(|percent| percent.is_finite())
         })
         .max_by(|left, right| left.total_cmp(right));
         let reset_at = ["x-codex", "x-ratelimit"]
@@ -1593,8 +1631,20 @@ mod tests {
         cfg.accounts.insert("c".into(), AccountConfig::Inbound);
         let router = Router::new(&cfg, affinity);
         let pool = &cfg.pools["default"];
-        router.accounts.lock().await.get_mut("b").unwrap().usage = Some(99);
-        router.accounts.lock().await.get_mut("c").unwrap().usage = Some(98);
+        router
+            .accounts
+            .lock()
+            .await
+            .get_mut("b")
+            .unwrap()
+            .legacy_usage = Some(99);
+        router
+            .accounts
+            .lock()
+            .await
+            .get_mut("c")
+            .unwrap()
+            .legacy_usage = Some(98);
         assert_eq!(
             router
                 .select("default", pool, None, None)
@@ -1663,16 +1713,9 @@ mod tests {
                 .await
                 .is_ok()
         );
-        // With the preserved account unavailable too, the fully used account is still tried.
+        // With the preserved account unavailable too, stop instead of spending credits.
         router.reauth_required("a").await;
-        assert_eq!(
-            router
-                .select("default", pool, None, None)
-                .await
-                .unwrap()
-                .account_id,
-            "b"
-        );
+        assert!(router.select("default", pool, None, None).await.is_none());
     }
 
     #[tokio::test]
@@ -1877,11 +1920,8 @@ mod tests {
             "b"
         );
         assert_eq!(affinity.get(&cohort).await.unwrap().account_id, "b");
-        // Usage alone does not invalidate mandatory continuity on its issuer.
-        assert_eq!(
-            router.select_exact(pool, "a").await.unwrap().account_id,
-            "a"
-        );
+        // Mandatory continuity must stop instead of spending credits on its issuer.
+        assert!(router.select_exact(pool, "a").await.is_none());
     }
 
     #[tokio::test]
@@ -1910,6 +1950,194 @@ mod tests {
 
         let fresh = router.select_preferred("default", pool, "a").await.unwrap();
         assert_eq!(fresh.account_id, "b");
+    }
+
+    #[tokio::test]
+    async fn reported_exhaustion_blocks_selection_and_pre_wire_validation_without_a_rejection() {
+        for header in [
+            "x-codex-primary-used-percent",
+            "x-ratelimit-secondary-used-percent",
+            "x-codex-tertiary-used-percent",
+            "x-codex-usage-percent",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, _, router, pool) = stale_test_router(dir.path());
+            let fresh = router.select("default", &pool, None, None).await.unwrap();
+            let bound = router.select_exact(&pool, "a").await.unwrap();
+            assert_eq!(fresh.account_id, "a");
+            let headers =
+                HeaderMap::from_iter([(header.parse().unwrap(), HeaderValue::from_static("100"))]);
+            router.observe_headers("a", &headers).await;
+
+            assert!(router.select_exact(&pool, "a").await.is_none(), "{header}");
+            assert_eq!(
+                router
+                    .select_preferred("default", &pool, "a")
+                    .await
+                    .unwrap()
+                    .account_id,
+                "b",
+                "{header}"
+            );
+            for selection in [&fresh, &bound] {
+                assert_eq!(
+                    router.validate_selection(selection, "default", &pool).await,
+                    Err(SelectionStaleReason::Quota),
+                    "{header}"
+                );
+            }
+            assert_eq!(
+                router
+                    .validate_account_wirable("a", Some(bound.account_generation))
+                    .await,
+                Err(SelectionStaleReason::Quota),
+                "{header}"
+            );
+            let snapshot = router.routing_snapshot().await;
+            let status = &snapshot.account_states["a"];
+            assert!(!status.available, "{header}");
+            assert_eq!(status.usage_percent, Some(100));
+            assert_eq!(status.unavailable_reason.as_deref(), Some("quota"));
+            assert!(status.retry_at_unix.is_none());
+            assert!(
+                status.quota_windows.is_empty(),
+                "no upstream rejection occurred"
+            );
+            assert!(router.context_account_available(&pool, "a").await);
+
+            router.observe_headers("b", &headers).await;
+            assert!(
+                router.select("default", &pool, None, None).await.is_none(),
+                "{header}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_usage_headers_preserve_exhausted_windows_until_authoritative_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, router, pool) = stale_test_router(dir.path());
+        let now = Utc::now().timestamp();
+        let mut snapshot = UsageSnapshot {
+            observed_at_unix: now,
+            reset_credits_available: None,
+            windows: BTreeMap::from([
+                (
+                    "primary".into(),
+                    QuotaWindowStatus {
+                        used_percent: Some(10),
+                        reset_at_unix: Some(now + 600),
+                        limit_window_seconds: Some(18000),
+                    },
+                ),
+                (
+                    "secondary".into(),
+                    QuotaWindowStatus {
+                        used_percent: Some(100),
+                        reset_at_unix: Some(now + 3600),
+                        limit_window_seconds: Some(604800),
+                    },
+                ),
+            ]),
+        };
+        router
+            .observe_usage_snapshot_for_owner("a", snapshot.clone(), &QuotaOwner::default())
+            .await;
+        let headers = HeaderMap::from_iter([
+            (
+                "x-codex-primary-used-percent".parse().unwrap(),
+                HeaderValue::from_static("20"),
+            ),
+            (
+                "x-codex-secondary-reset-at".parse().unwrap(),
+                (now + 3600).to_string().parse().unwrap(),
+            ),
+        ]);
+        router.observe_headers("a", &headers).await;
+        assert!(router.select_exact(&pool, "a").await.is_none());
+        let status = router.routing_snapshot().await.account_states["a"].clone();
+        assert_eq!(status.usage_percent, Some(100));
+        assert_eq!(status.retry_at_unix, Some(now + 3600));
+        assert_eq!(status.usage_windows["secondary"].used_percent, Some(100));
+        assert_eq!(
+            status.usage_windows["secondary"].limit_window_seconds,
+            Some(604800)
+        );
+
+        snapshot.windows.get_mut("secondary").unwrap().used_percent = Some(0);
+        router
+            .observe_usage_snapshot_for_owner("a", snapshot, &QuotaOwner::default())
+            .await;
+        assert!(router.select_exact(&pool, "a").await.is_some());
+        assert!(router.routing_snapshot().await.account_states["a"].available);
+    }
+
+    #[tokio::test]
+    async fn reported_exhaustion_recovers_only_after_every_blocking_window_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, router, pool) = stale_test_router(dir.path());
+        let now = Utc::now().timestamp();
+        let mut headers = HeaderMap::from_iter([
+            (
+                "x-codex-primary-used-percent".parse().unwrap(),
+                HeaderValue::from_static("100"),
+            ),
+            (
+                "x-codex-primary-reset-at".parse().unwrap(),
+                (now - 1).to_string().parse().unwrap(),
+            ),
+            (
+                "x-codex-secondary-used-percent".parse().unwrap(),
+                HeaderValue::from_static("100"),
+            ),
+            (
+                "x-codex-secondary-reset-at".parse().unwrap(),
+                (now + 600).to_string().parse().unwrap(),
+            ),
+        ]);
+        router.observe_headers("a", &headers).await;
+        assert!(router.select_exact(&pool, "a").await.is_none());
+        assert_eq!(
+            router.routing_snapshot().await.account_states["a"].retry_at_unix,
+            Some(now + 600)
+        );
+
+        headers.insert(
+            "x-codex-secondary-reset-at",
+            (now - 1).to_string().parse().unwrap(),
+        );
+        router.observe_headers("a", &headers).await;
+        let selection = router.select_exact(&pool, "a").await.unwrap();
+        assert!(
+            router
+                .validate_selection(&selection, "default", &pool)
+                .await
+                .is_ok()
+        );
+        assert!(
+            router
+                .validate_account_wirable("a", Some(selection.account_generation))
+                .await
+                .is_ok()
+        );
+        assert!(router.routing_snapshot().await.account_states["a"].available);
+
+        // A new exhausted report without a deadline cannot inherit the elapsed reset.
+        router
+            .observe_headers(
+                "a",
+                &HeaderMap::from_iter([(
+                    "x-codex-primary-used-percent".parse().unwrap(),
+                    HeaderValue::from_static("100"),
+                )]),
+            )
+            .await;
+        assert!(router.select_exact(&pool, "a").await.is_none());
+        assert!(
+            router.routing_snapshot().await.account_states["a"]
+                .retry_at_unix
+                .is_none()
+        );
     }
 
     #[tokio::test]

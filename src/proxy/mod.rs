@@ -9660,7 +9660,8 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                                 .status(StatusCode::OK)
                                 .header(CONTENT_TYPE, "application/json");
                             let body = if path == "/backend-api/codex/files" {
-                                builder = builder.header("x-codex-primary-used-percent", "100");
+                                // Cross the soft switch threshold while leaving the file owner eligible.
+                                builder = builder.header("x-codex-primary-used-percent", "99");
                                 Bytes::from_static(br#"{"file_id":"file_owned","upload_url":"https://blob.invalid/upload"}"#)
                             } else if path.ends_with("/files/file_owned/uploaded") {
                                 Bytes::from_static(br#"{"status":"success"}"#)
@@ -11473,7 +11474,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
     }
 
     #[tokio::test]
-    async fn http_bridge_preserves_hard_turn_state_owner_for_fresh_frame_thread() {
+    async fn http_bridge_stops_at_exhausted_hard_turn_state_owner_for_fresh_frame_thread() {
         let dir = tempfile::tempdir().unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11547,9 +11548,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             .unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&event).unwrap()["type"],
-            "response.completed"
+            "error"
         );
-        assert_eq!(*seen.lock().unwrap(), ["Bearer token-a".to_owned()]);
+        assert!(seen.lock().unwrap().is_empty());
         proxy_task.abort();
         upstream_task.abort();
     }

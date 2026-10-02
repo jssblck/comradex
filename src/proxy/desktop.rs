@@ -261,25 +261,16 @@ impl App {
             return false;
         };
         let snapshot = self.router.routing_snapshot().await;
-        let now = chrono::Utc::now().timestamp();
         for name in &pool.members {
-            if snapshot.account_states.get(name).is_some_and(|account| {
-                let reported_exhausted: Vec<_> = account
-                    .usage_windows
-                    .values()
-                    .filter(|window| window.used_percent.is_some_and(|used| used >= 100))
-                    .collect();
-                let known_reset = !reported_exhausted.is_empty()
-                    && reported_exhausted
-                        .iter()
-                        .all(|window| window.reset_at_unix.is_some_and(|reset| reset <= now));
-                account.available
-                    && (account.usage_percent.is_none_or(|usage| usage < 100) || known_reset)
-            }) && self
-                .config
-                .accounts
+            if snapshot
+                .account_states
                 .get(name)
-                .is_some_and(|account| self.auth.credentials_usable(account, inbound))
+                .is_some_and(|account| account.available)
+                && self
+                    .config
+                    .accounts
+                    .get(name)
+                    .is_some_and(|account| self.auth.credentials_usable(account, inbound))
             {
                 return true;
             }
