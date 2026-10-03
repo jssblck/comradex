@@ -198,7 +198,7 @@ impl App {
                 status.as_u16()
             );
             let snapshot = parse_usage(&bytes, now)?;
-            self.observe_claude_fable_usage(account, credential.owner(), &bytes)
+            self.observe_claude_reporting_usage(account, credential.owner(), &bytes)
                 .await;
             self.observe_claude_reset_credits(account, credential.owner(), &bytes)
                 .await;

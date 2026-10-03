@@ -458,7 +458,7 @@ async fn management_fable_reporting_replaces_optional_metadata_without_affecting
     let valid = br#"{"seven_day_fable":{"utilization":99.9,"resets_at":"2100-01-01T00:00:00Z","extra":"must-not-leak"}}"#;
     fixture
         .app
-        .observe_claude_fable_usage("grace", owner.clone(), valid)
+        .observe_claude_reporting_usage("grace", owner.clone(), valid)
         .await;
     assert_eq!(
         usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await["seven_day_fable"],
@@ -478,11 +478,11 @@ async fn management_fable_reporting_replaces_optional_metadata_without_affecting
     ] {
         fixture
             .app
-            .observe_claude_fable_usage("grace", owner.clone(), valid)
+            .observe_claude_reporting_usage("grace", owner.clone(), valid)
             .await;
         fixture
             .app
-            .observe_claude_fable_usage("grace", owner.clone(), bytes)
+            .observe_claude_reporting_usage("grace", owner.clone(), bytes)
             .await;
         let body = usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await;
         assert!(body.get("seven_day_fable").is_none());
@@ -490,7 +490,7 @@ async fn management_fable_reporting_replaces_optional_metadata_without_affecting
     }
     fixture
         .app
-        .observe_claude_fable_usage("grace", owner, br#"{"seven_day_fable":{"utilization":0}}"#)
+        .observe_claude_reporting_usage("grace", owner, br#"{"seven_day_fable":{"utilization":0}}"#)
         .await;
     assert_eq!(
         usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await["seven_day_fable"],
@@ -520,9 +520,9 @@ async fn management_fable_reporting_rejects_data_from_a_replaced_account_or_orga
         let bytes = br#"{"seven_day_fable":{"utilization":50,"resets_at":null}}"#;
         fixture
             .app
-            .observe_claude_fable_usage("grace", owner.clone(), bytes)
+            .observe_claude_reporting_usage("grace", owner.clone(), bytes)
             .await;
-        assert!(fixture.app.claude_fable_usage("grace").await.is_some());
+        assert!(fixture.app.claude_reporting_usage("grace").await.is_some());
         let path = home.join("claude-auth.json");
         let mut credential: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         credential[field] = json!("33333333-3333-4333-8333-333333333333");
@@ -534,7 +534,7 @@ async fn management_fable_reporting_rejects_data_from_a_replaced_account_or_orga
         // A delayed old poll also cannot expose its quota for the replacement.
         fixture
             .app
-            .observe_claude_fable_usage("grace", owner, bytes)
+            .observe_claude_reporting_usage("grace", owner, bytes)
             .await;
         let body = usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await;
         assert_eq!(body["five_hour"]["utilization"], 25);
@@ -542,7 +542,7 @@ async fn management_fable_reporting_rejects_data_from_a_replaced_account_or_orga
         let current = crate::claude::auth::read(home).unwrap().owner();
         fixture
             .app
-            .observe_claude_fable_usage("grace", current, bytes)
+            .observe_claude_reporting_usage("grace", current, bytes)
             .await;
         assert_eq!(
             usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await["seven_day_fable"]["utilization"],

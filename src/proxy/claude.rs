@@ -39,13 +39,13 @@ pub(super) struct Claude {
     usage_url: String,
     /// Per-account usage poll cooldown: (retry at, current throttle delay).
     usage_backoff: Mutex<HashMap<String, (u64, u64)>>,
-    fable_usage: Mutex<HashMap<String, FableUsage>>,
+    reporting_usage: Mutex<HashMap<String, ReportingUsage>>,
     activation: Mutex<Result<crate::claude::maintenance::ActivationLedger>>,
     sessions: Mutex<HashMap<String, Weak<Session>>>,
 }
-struct FableUsage {
+struct ReportingUsage {
     owner: crate::auth::QuotaOwner,
-    value: serde_json::Value,
+    value: serde_json::Map<String, serde_json::Value>,
 }
 #[derive(Default)]
 struct Session {
@@ -63,7 +63,7 @@ impl Claude {
             upstream: crate::claude::UPSTREAM.into(),
             usage_url: format!("{}/api/oauth/usage", crate::claude::UPSTREAM),
             usage_backoff: Mutex::new(HashMap::new()),
-            fable_usage: Mutex::new(HashMap::new()),
+            reporting_usage: Mutex::new(HashMap::new()),
             activation: Mutex::new(crate::claude::maintenance::ActivationLedger::open(
                 config
                     .proxy
@@ -88,22 +88,25 @@ impl Claude {
 }
 
 impl App {
-    pub(super) async fn observe_claude_fable_usage(
+    pub(super) async fn observe_claude_reporting_usage(
         &self,
         account: &str,
         owner: crate::auth::QuotaOwner,
         bytes: &[u8],
     ) {
-        let value = crate::claude::maintenance::parse_fable_usage(bytes);
-        let mut observations = self.claude.fable_usage.lock().await;
+        let value = crate::claude::maintenance::parse_reporting_usage(bytes);
+        let mut observations = self.claude.reporting_usage.lock().await;
         if let Some(value) = value {
-            observations.insert(account.into(), FableUsage { owner, value });
+            observations.insert(account.into(), ReportingUsage { owner, value });
         } else {
             observations.remove(account);
         }
     }
 
-    pub(super) async fn claude_fable_usage(&self, account: &str) -> Option<serde_json::Value> {
+    pub(super) async fn claude_reporting_usage(
+        &self,
+        account: &str,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
         let AccountConfig::ClaudeHome { path } = &self.config.accounts[account] else {
             return None;
         };
@@ -113,7 +116,7 @@ impl App {
             .ok()?
             .ok()?;
         self.claude
-            .fable_usage
+            .reporting_usage
             .lock()
             .await
             .get(account)
@@ -746,7 +749,17 @@ mod tests {
                                     )
                                     .unwrap()
                                     .to_rfc3339();
-                                    let data = json!({"five_hour":{"utilization":if first {100}else{25},"resets_at":reset},"seven_day":{"utilization":10,"resets_at":reset},"seven_day_fable":{"utilization":if first {25.5}else{100.0},"resets_at":reset},"cedar_ember":{"eligible":true,"next_grant_id":"mock-grant","grants":[{"id":"mock-grant","resets_left":2,"usable_now":true}]}});
+                                    let mut data = json!({"five_hour":{"utilization":if first {100}else{25},"resets_at":reset},"seven_day":{"utilization":10,"resets_at":reset},"cedar_ember":{"eligible":true,"next_grant_id":"mock-grant","grants":[{"id":"mock-grant","resets_left":2,"usable_now":true}]}});
+                                    if first {
+                                        data["seven_day_fable"] =
+                                            json!({"utilization":25.5,"resets_at":reset});
+                                    } else {
+                                        data["limits"] = json!([
+                                            {"kind":"session","group":"session","percent":25,"resets_at":reset,"scope":null,"is_active":true,"severity":"normal"},
+                                            {"kind":"weekly_all","group":"weekly","percent":10,"resets_at":reset,"scope":null,"is_active":true,"severity":"normal"},
+                                            {"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":reset,"scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false,"severity":"critical"}
+                                        ]);
+                                    }
                                     Response::builder()
                                         .status(if status == StatusCode::TOO_MANY_REQUESTS {
                                             status
@@ -1501,12 +1514,22 @@ kind="claude_inbound"
                 assert_eq!(envelope["status_code"], 200);
                 let body: serde_json::Value =
                     serde_json::from_str(envelope["body"].as_str().unwrap()).unwrap();
-                assert_eq!(body["seven_day_fable"]["utilization"], percent);
-                assert_eq!(
-                    chrono::DateTime::parse_from_rfc3339(
-                        body["seven_day_fable"]["resets_at"].as_str().unwrap()
+                let (utilization, reset) = if account == "grace" {
+                    (
+                        &body["seven_day_fable"]["utilization"],
+                        &body["seven_day_fable"]["resets_at"],
                     )
-                    .unwrap(),
+                } else {
+                    assert!(body.get("seven_day_fable").is_none());
+                    assert_eq!(body["limits"][2]["scope"]["model"]["display_name"], "Fable");
+                    (
+                        &body["limits"][2]["percent"],
+                        &body["limits"][2]["resets_at"],
+                    )
+                };
+                assert_eq!(*utilization, percent);
+                assert_eq!(
+                    chrono::DateTime::parse_from_rfc3339(reset.as_str().unwrap()).unwrap(),
                     chrono::DateTime::parse_from_rfc3339(
                         body["seven_day"]["resets_at"].as_str().unwrap()
                     )
