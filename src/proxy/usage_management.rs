@@ -60,27 +60,37 @@ impl App {
         }
         match request.uri().path() {
             "/v0/management/auth-files" if request.method() == Method::GET => {
-                let files: Vec<_> = self
-                    .config
-                    .accounts
-                    .iter()
-                    .filter_map(|(name, account)| {
-                        let provider = managed_provider(account)?;
-                        let mut file = json!({
-                            "id": name,
-                            "auth_index": name,
-                            "provider": provider,
-                            "disabled": false,
-                        });
-                        if let Some(metadata) = account_metadata(account) {
-                            file.as_object_mut()
-                                .unwrap()
-                                .extend(metadata.as_object().unwrap().clone());
-                        }
-                        Some(file)
-                    })
-                    .collect();
-                management_json(json!({ "files": files }))
+                let config = self.config.clone();
+                let files = tokio::task::spawn_blocking(move || {
+                    config
+                        .accounts
+                        .iter()
+                        .filter_map(|(name, account)| {
+                            let provider = managed_provider(account)?;
+                            let mut file = json!({
+                                "id": name,
+                                "auth_index": name,
+                                "provider": provider,
+                                "disabled": false,
+                            });
+                            if let Some(metadata) = account_metadata(account) {
+                                file.as_object_mut()
+                                    .unwrap()
+                                    .extend(metadata.as_object().unwrap().clone());
+                            }
+                            Some(file)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+                match files {
+                    Ok(files) => management_json(json!({ "files": files })),
+                    Err(_) => error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "account list could not be built",
+                    ),
+                }
             }
             "/v0/management/api-call" | "/v0/management/reset-quota"
                 if request.method() == Method::POST =>

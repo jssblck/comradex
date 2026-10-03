@@ -193,7 +193,6 @@ async fn reset_credits_reads_only_the_selected_account_and_preserves_provider_da
     assert_eq!(seen[0].0, Method::GET);
     assert_eq!(seen[0].2[AUTHORIZATION], "Bearer test-codex-secret");
     assert_eq!(seen[0].2["chatgpt-account-id"], "ada-account");
-    assert_eq!(seen[0].2["originator"], "Codex Desktop");
     assert_eq!(upstream.spends.load(Ordering::Relaxed), 0);
     assert_eq!(before, fixture.app.router.routing_snapshot().await);
     fixture.app.shutdown_connections().await;

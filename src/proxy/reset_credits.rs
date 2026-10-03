@@ -45,46 +45,54 @@ impl App {
         account_id: &str,
         consume: Option<ConsumeCredit>,
     ) -> Response<ProxyBody> {
-        let operation = tokio::time::timeout(
-            USAGE_FETCH_ACCOUNT_TIMEOUT,
-            self.codex_reset_credits_inner(account_id, consume),
-        )
-        .await;
+        // Redemption bounds each of its own steps. An outer deadline could report a
+        // confirmed reset as failed while its follow-up usage refresh is still running.
+        let operation = match consume {
+            Some(credit) => self.consume_codex_reset_credit(account_id, credit).await,
+            None => tokio::time::timeout(
+                USAGE_FETCH_ACCOUNT_TIMEOUT,
+                self.list_codex_reset_credits(account_id),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("reset-credit listing timed out"))),
+        };
         match operation {
-            Ok(Ok((status, body))) => super::usage_management::api_response(status, body),
-            _ => super::usage_management::api_response(
+            Ok((status, body)) => super::usage_management::api_response(status, body),
+            Err(_) => super::usage_management::api_response(
                 StatusCode::BAD_GATEWAY,
                 json!({ "error": "reset-credit request could not be completed" }),
             ),
         }
     }
 
-    async fn codex_reset_credits_inner(
+    async fn consume_codex_reset_credit(
         &self,
         account_id: &str,
-        consume: Option<ConsumeCredit>,
+        credit: ConsumeCredit,
     ) -> Result<(StatusCode, Value)> {
-        if let Some(credit) = consume {
-            return match self
-                .use_reset_credit(account_id, &credit.credit_id, &credit.redeem_request_id)
-                .await
-            {
-                Ok(result) => Ok((StatusCode::OK, serde_json::to_value(result)?)),
-                Err(error) => {
-                    if let Some(provider) = error.downcast_ref::<ResetProviderError>() {
-                        return Ok((
-                            provider.0,
-                            json!({ "error": "provider rejected reset-credit request" }),
-                        ));
-                    }
-                    Err(error)
-                }
-            };
+        match self
+            .use_reset_credit(account_id, &credit.credit_id, &credit.redeem_request_id)
+            .await
+        {
+            Ok(result) => Ok((StatusCode::OK, serde_json::to_value(result)?)),
+            Err(error) => match error.downcast_ref::<ResetProviderError>() {
+                Some(provider) => Ok((
+                    provider.0,
+                    json!({ "error": "provider rejected reset-credit request" }),
+                )),
+                None => Err(error),
+            },
         }
+    }
+
+    async fn list_codex_reset_credits(&self, account_id: &str) -> Result<(StatusCode, Value)> {
         let account = &self.config.accounts[account_id];
         anyhow::ensure!(matches!(account, AccountConfig::CodexHome { .. }));
+        let url = self.reset_credits_url(false)?;
         let mut credentials = self.auth.resolve(account, &hyper::HeaderMap::new()).await?;
-        let mut response = self.send_reset_credit_request(&credentials).await?;
+        let mut response = self
+            .fetch_account_endpoint(&credentials, Method::GET, url.clone(), empty_body())
+            .await?;
         // A rejected read may refresh once. A redemption is never replayed automatically.
         if response.0 == StatusCode::UNAUTHORIZED {
             credentials = self
@@ -92,51 +100,20 @@ impl App {
                 .force_refresh(account, &credentials)
                 .await?
                 .context("credentials cannot refresh")?;
-            response = self.send_reset_credit_request(&credentials).await?;
+            response = self
+                .fetch_account_endpoint(&credentials, Method::GET, url, empty_body())
+                .await?;
         }
-        if !response.0.is_success() {
+        let (status, bytes) = response;
+        if !status.is_success() {
             return Ok((
-                response.0,
+                status,
                 json!({ "error": "provider rejected reset-credit request" }),
             ));
         }
-        anyhow::ensure!(response.1["credits"].is_array(), "missing reset credits");
-        Ok(response)
-    }
-
-    async fn send_reset_credit_request(
-        &self,
-        credentials: &Credentials,
-    ) -> Result<(StatusCode, Value)> {
-        let mut request = Request::builder()
-            .method(Method::GET)
-            .uri(self.reset_credits_url(false)?)
-            .header(AUTHORIZATION, &credentials.authorization)
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json")
-            .header("openai-beta", "codex-1")
-            .header("originator", "Codex Desktop");
-        if let Some(id) = &credentials.account_id {
-            request = request.header("chatgpt-account-id", id);
-        }
-        tokio::time::timeout(USAGE_FETCH_TIMEOUT, async {
-            let response = self.client.request(request.body(empty_body())?).await?;
-            let status = response.status();
-            let bytes =
-                http_body_util::Limited::new(response.into_body(), MAX_USAGE_RESPONSE_BYTES)
-                    .collect()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("invalid reset-credit response body"))?
-                    .to_bytes();
-            let value = if status.is_success() {
-                serde_json::from_slice(&bytes)?
-            } else {
-                Value::Null
-            };
-            Ok((status, value))
-        })
-        .await
-        .context("reset-credit request timed out")?
+        let body: Value = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(body["credits"].is_array(), "missing reset credits");
+        Ok((status, body))
     }
 
     pub(super) async fn acknowledge_credit_reset(&self, account: &str) -> Response<ProxyBody> {
@@ -193,7 +170,11 @@ impl App {
         let AccountConfig::ClaudeHome { path } = &self.config.accounts[account] else {
             return None;
         };
-        let current = crate::claude::auth::read(path).ok()?;
+        let path = path.clone();
+        let current = tokio::task::spawn_blocking(move || crate::claude::auth::read(&path))
+            .await
+            .ok()?
+            .ok()?;
         self.reset_credits
             .claude
             .lock()
