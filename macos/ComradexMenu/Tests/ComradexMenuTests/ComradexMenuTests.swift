@@ -8,7 +8,9 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertEqual(good.safeVerificationURL.host, "claude.ai")
         XCTAssertEqual(good.safeVerificationURL.path, "/oauth/authorize")
         XCTAssertEqual(good.statusLabel, "Complete sign-in in your browser")
-        for address in ["https://evil.example/oauth/authorize", "https://claude.ai.evil.example/oauth/authorize", "https://claude.ai@evil.example/oauth/authorize", "http://claude.ai/oauth/authorize", "https://claude.ai/other"] {
+        let current = LoginSnapshot(account: "grace", provider: "claude", state: .running, verificationURI: "https://claude.com/cai/oauth/authorize?state=synthetic")
+        XCTAssertEqual(current.safeVerificationURL.absoluteString, "https://claude.com/cai/oauth/authorize?state=synthetic")
+        for address in ["https://evil.example/oauth/authorize", "https://claude.ai.evil.example/oauth/authorize", "https://claude.ai@evil.example/oauth/authorize", "http://claude.ai/oauth/authorize", "https://claude.ai/other", "https://claude.com/oauth/authorize", "https://claude.ai/cai/oauth/authorize", "https://claude.com.evil.example/cai/oauth/authorize"] {
             let invalid = LoginSnapshot(account: "grace", provider: "claude", state: .running, verificationURI: address)
             XCTAssertEqual(invalid.safeVerificationURL.absoluteString, "https://claude.ai/login")
         }

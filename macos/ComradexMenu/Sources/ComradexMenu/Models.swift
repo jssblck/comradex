@@ -258,7 +258,9 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
     var safeVerificationURL: URL {
         if isClaude {
             if let verificationURI, let url = URL(string: verificationURI),
-               url.scheme == "https", url.host == "claude.ai", url.path == "/oauth/authorize",
+               url.scheme == "https",
+               (url.host == "claude.ai" && url.path == "/oauth/authorize")
+                   || (url.host == "claude.com" && url.path == "/cai/oauth/authorize"),
                url.user == nil, url.password == nil, url.port == nil {
                 return url
             }

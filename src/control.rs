@@ -267,8 +267,12 @@ impl BoundedLoginOutput {
             (token == "https://auth.openai.com/codex/device"
                 || token.parse::<hyper::Uri>().is_ok_and(|uri| {
                     uri.scheme_str() == Some("https")
-                        && uri.authority().is_some_and(|a| a.as_str() == "claude.ai")
-                        && uri.path() == "/oauth/authorize"
+                        && matches!(
+                            (uri.authority().map(|a| a.as_str()), uri.path()),
+                            // Older Claude Code releases use claude.ai; newer ones claude.com.
+                            (Some("claude.ai"), "/oauth/authorize")
+                                | (Some("claude.com"), "/cai/oauth/authorize")
+                        )
                         && uri.query().is_some()
                 }))
             .then(|| token.to_owned())
@@ -2263,6 +2267,29 @@ path = "accounts/work"
             let mut output = BoundedLoginOutput::default();
             output.append(format!("\x1b[1;94m{url}\x1b[0m\n").as_bytes());
             assert_eq!(output.allowed_fields(), (None, None));
+        }
+    }
+
+    #[test]
+    fn bounded_login_output_accepts_only_claude_authorization_urls() {
+        for url in [
+            "https://claude.ai/oauth/authorize?state=synthetic",
+            "https://claude.com/cai/oauth/authorize?state=synthetic",
+        ] {
+            let mut output = BoundedLoginOutput::default();
+            output.append(format!("Open {url}\n").as_bytes());
+            assert_eq!(output.allowed_fields().0.as_deref(), Some(url));
+        }
+        for url in [
+            "https://claude.com/oauth/authorize?state=synthetic",
+            "https://claude.ai/cai/oauth/authorize?state=synthetic",
+            "https://claude.com.evil.example/cai/oauth/authorize?state=synthetic",
+            "https://claude.com/cai/oauth/authorize",
+            "http://claude.com/cai/oauth/authorize?state=synthetic",
+        ] {
+            let mut output = BoundedLoginOutput::default();
+            output.append(format!("Open {url}\n").as_bytes());
+            assert_eq!(output.allowed_fields().0, None, "{url}");
         }
     }
 

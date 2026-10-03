@@ -45,12 +45,12 @@ The command updates the configuration, restarts the daemon if it is installed as
 Claude Code accounts use a separate pool and loopback listener. Add accounts through the official Claude Code login:
 
 ```sh
-comradex account add grace --claude --pool claude
-comradex account add ada --claude --pool claude
+comradex account add grace --claude
+comradex account add ada --claude
 comradex install --listener claude
 ```
 
-The first add creates the `claude` pool and its listener at `127.0.0.1:10101`; change the address in `comradex.toml` if needed. A running macOS service reloads after accounts are added; restart a manually launched daemon yourself. Restart Claude Code after installation.
+`--claude` uses the `claude` pool unless `--pool` names another. The first add creates the pool and its listener at `127.0.0.1:10101`; change the address in `comradex.toml` if needed. A running macOS service reloads after accounts are added; restart a manually launched daemon yourself. Restart Claude Code after installation.
 
 Installation sets only `env.ANTHROPIC_BASE_URL` in Claude Code's `settings.json`, using the listener's secret URL. Use `--claude-settings <path>` for another settings file. Keep Claude Code's ordinary subscription login; do not configure a placeholder API key or auth token. `comradex uninstall` restores both Claude and Codex gateway settings without touching unrelated settings, and refuses to overwrite a gateway URL changed after installation.
 

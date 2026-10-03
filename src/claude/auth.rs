@@ -26,6 +26,10 @@ use tokio::sync::Mutex;
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 type AuthClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+#[cfg(not(test))]
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(test)]
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 // Intentionally no Debug: token documents must never appear in diagnostics.
 #[derive(Clone, Serialize, Deserialize)]
@@ -130,16 +134,14 @@ impl Resolver {
         let resolver = self.clone();
         let home = home.to_owned();
         let rejected = rejected.map(str::to_owned);
-        // A disconnected inference client must not cancel a rotating refresh grant.
-        tokio::spawn(async move {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                resolver.resolve_inner(&home, rejected.as_deref()),
-            )
-            .await
-            .context("Claude credential resolution timed out")?
-        })
+        // Neither a disconnected inference client nor this timeout may cancel a rotating
+        // refresh grant: the spawned refresh always finishes and persists the new grant.
+        tokio::time::timeout(
+            RESOLVE_TIMEOUT,
+            tokio::spawn(async move { resolver.resolve_inner(&home, rejected.as_deref()).await }),
+        )
         .await
+        .context("Claude credential resolution timed out")?
         .context("join Claude refresh")?
     }
     pub async fn needs_login(&self, home: &Path) -> bool {
@@ -446,6 +448,7 @@ mod tests {
     async fn refresh_server(
         home: &Path,
         status: u16,
+        delay: std::time::Duration,
     ) -> (Resolver, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/token", listener.local_addr().unwrap());
@@ -467,6 +470,7 @@ mod tests {
                                 json!({"grant_type":"refresh_token","refresh_token":"synthetic-refresh","client_id":CLIENT_ID})
                             );
                             seen.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(delay).await;
                             let response=Response::builder().status(status).header("retry-after","3600").body(Full::new(Bytes::from_static(br#"{"access_token":"sk-ant-oat01-new","refresh_token":"synthetic-rotated","expires_in":3600}"#))).unwrap();
                             Ok::<_, Infallible>(response)
                         }
@@ -497,7 +501,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let before = credential();
         before.persist(dir.path()).unwrap();
-        let (resolver, count, task) = refresh_server(dir.path(), 200).await;
+        let (resolver, count, task) = refresh_server(dir.path(), 200, Default::default()).await;
         let (one, two) = tokio::join!(
             resolver.resolve(dir.path(), Some(&before.access_token)),
             resolver.resolve(dir.path(), Some(&before.access_token))
@@ -519,7 +523,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             credential().persist(dir.path()).unwrap();
             let original = fs::read(dir.path().join("claude-auth.json")).unwrap();
-            let (resolver, count, task) = refresh_server(dir.path(), status).await;
+            let (resolver, count, task) =
+                refresh_server(dir.path(), status, Default::default()).await;
             for _ in 0..2 {
                 assert!(resolver.resolve(dir.path(), None).await.is_err());
             }
@@ -531,5 +536,20 @@ mod tests {
             );
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_caller_does_not_cancel_a_rotating_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        credential().persist(dir.path()).unwrap();
+        let delay = RESOLVE_TIMEOUT * 2;
+        let (resolver, count, task) = refresh_server(dir.path(), 200, delay).await;
+        assert!(resolver.resolve(dir.path(), None).await.is_err());
+        tokio::time::sleep(delay).await;
+        let saved = read(dir.path()).unwrap();
+        assert_eq!(saved.refresh_token, "synthetic-rotated");
+        assert_eq!(saved.access_token, "sk-ant-oat01-new");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 }

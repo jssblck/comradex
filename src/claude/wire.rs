@@ -370,13 +370,16 @@ fn sign_existing(body: &mut [u8]) -> Result<()> {
     if !decoded.starts_with("x-anthropic-billing-header:") || !decoded.contains("cch=") {
         return Ok(());
     }
-    let patch = decoded
-        .split("cc_version=2.1.")
+    // Releases since 2.1.220 share this checksum. Newer releases are accepted so routine
+    // Claude Code updates keep working; the field shape checks below still fail closed.
+    let version: Option<Vec<u32>> = decoded
+        .split("cc_version=")
         .nth(1)
-        .and_then(|s| s.split(['.', ';']).next())
-        .and_then(|s| s.parse::<u32>().ok());
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.split('.').take(3).map(|part| part.parse().ok()).collect());
     ensure!(
-        patch.is_some_and(|v| (220..=281).contains(&v)) && decoded.matches("cch=").count() == 1,
+        version.is_some_and(|v| v.len() == 3 && v[..] >= [2, 1, 220][..])
+            && decoded.matches("cch=").count() == 1,
         "unverified Claude checksum version"
     );
     let Some(pos) = text.get().find("cch=") else {
@@ -693,9 +696,31 @@ mod tests {
                 .replace(&"a".repeat(64), &"b".repeat(64))
                 .as_bytes()
         );
-        let mut unknown =
-            br#"{"system":[{"text":"x-anthropic-billing-header: cc_version=3.0.0; cch=00000;"}]}"#
-                .to_vec();
-        assert!(sign_existing(&mut unknown).is_err());
+        for rejected in [
+            "cc_version=2.1.219.test; cch=00000;",
+            "cc_version=2.1; cch=00000;",
+            "cc_version=next.1.300; cch=00000;",
+            "cc_version=2.1.288.test; cch=0000;",
+            "cc_version=2.1.288.test; cch=00000; cch=00000;",
+        ] {
+            let mut unknown =
+                format!(r#"{{"system":[{{"text":"x-anthropic-billing-header: {rejected}"}}]}}"#)
+                    .into_bytes();
+            assert!(sign_existing(&mut unknown).is_err(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn checksum_accepts_releases_after_the_verified_range() {
+        for version in ["2.1.288.test", "2.2.0", "3.0.0"] {
+            let mut bytes = format!(
+                r#"{{"system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version={version}; cc_entrypoint=cli; cch=00000;"}}]}}"#
+            )
+            .into_bytes();
+            let original = bytes.clone();
+            sign_existing(&mut bytes).unwrap();
+            assert_eq!(bytes.len(), original.len(), "{version}");
+            assert_ne!(bytes, original, "{version}");
+        }
     }
 }
