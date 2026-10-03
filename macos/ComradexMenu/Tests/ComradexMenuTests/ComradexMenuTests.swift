@@ -911,6 +911,9 @@ private struct SelectionWithoutStatusClient: ControlServing {
 }
 
 extension ControlServing {
+    func useResetCredit(account: String, creditID: String, requestID: String) async throws -> ResetResultSnapshot {
+        throw ControlSocketError.daemon("reset unavailable in this fixture")
+    }
     func refreshUsage() async throws {}
     func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot {
         throw ControlSocketError.daemon("role change unavailable")

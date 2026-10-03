@@ -97,6 +97,23 @@ enum AccountCommand {
         #[arg(long)]
         no_login: bool,
     },
+    /// Read current reset credits and their exact expiration timestamps
+    ResetCredits {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Consume one specific reset credit (requires --confirm)
+    UseReset {
+        name: String,
+        #[arg(long)]
+        credit_id: String,
+        #[arg(long, required = true)]
+        confirm: bool,
+        /// Reuse this ID when retrying an ambiguous result
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     /// List configured accounts and their sign-in state
     List,
     /// Prefer an account for new work without interrupting active turns
@@ -427,12 +444,12 @@ async fn serve_once(path: &Path) -> Result<bool> {
     )?;
     let reload = control_server.reload_requested();
     let usage_refresh_requested = control_server.usage_refresh_requested();
-    let mut control_task = tokio::spawn(control_server.run());
     info!(
         elapsed_ms = startup.elapsed().as_millis(),
         "daemon startup: control socket bound; initializing transports and stores"
     );
     let app = App::new(config.clone(), router.clone(), stats.clone())?;
+    let mut control_task = tokio::spawn(control_server.with_app(app.clone()).run());
     info!(
         elapsed_ms = startup.elapsed().as_millis(),
         "daemon startup: initialization complete; starting listeners"
@@ -698,6 +715,9 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         let routing_status = routing.and_then(|routing| routing.account_states.get(name));
         let state = account_status_state(account, routing_status);
         println!("  {name:width$}  {:36}  {pools}", state);
+        if let Some(credits) = routing_status.and_then(|state| state.reset_credits.as_ref()) {
+            print_reset_credits(credits);
+        }
     }
 
     println!("\npools");
@@ -728,6 +748,17 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
     println!("\ntraffic");
     match snapshot {
         Some(stats) => {
+            if let Some(memory) = &stats.memory {
+                println!(
+                    "  Rust allocations: {} live, {} peak; bridge history: {} live, {} peak; turn copies: {} live, {} peak",
+                    human_bytes(memory.rust_live_bytes),
+                    human_bytes(memory.rust_peak_bytes),
+                    human_bytes(memory.bridge_continuation_bytes),
+                    human_bytes(memory.bridge_continuation_peak_bytes),
+                    human_bytes(memory.bridge_turn_copy_bytes),
+                    human_bytes(memory.bridge_turn_copy_peak_bytes),
+                );
+            }
             println!(
                 "  {} HTTP request(s) and {} bridge turn(s) in flight, {} open connection(s)",
                 stats.inflight_http, stats.inflight_bridge_turns, stats.open_upgrades
@@ -945,6 +976,28 @@ fn human_bytes(bytes: usize) -> String {
     }
 }
 
+fn print_reset_credits(snapshot: &comradex::reset_credits::ResetCreditsSnapshot) {
+    println!(
+        "    {} reset credit(s) available (checked {})",
+        snapshot.available_count_at(chrono::Utc::now()),
+        snapshot.observed_at_unix
+    );
+    if let Some(credits) = &snapshot.credits {
+        for credit in credits {
+            println!(
+                "      {} · {} · {} · expires {}",
+                credit.id,
+                credit.title.as_deref().unwrap_or(&credit.reset_type),
+                credit.status,
+                credit.expires_at.as_deref().unwrap_or("never")
+            );
+        }
+    }
+    if let Some(error) = &snapshot.error {
+        println!("      Credit details unavailable: {error}");
+    }
+}
+
 fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
     match command {
         AccountCommand::Add {
@@ -969,6 +1022,38 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             } else {
                 login(config_path, &name)?;
             }
+            Ok(())
+        }
+        AccountCommand::ResetCredits { name, json } => {
+            let config = load_config(config_path)?;
+            let credits = control::read_reset_credits(&state_dir(&config), &name)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&credits)?);
+            } else {
+                println!("{name}");
+                print_reset_credits(&credits);
+            }
+            Ok(())
+        }
+        AccountCommand::UseReset {
+            name,
+            credit_id,
+            confirm,
+            request_id,
+        } => {
+            if !confirm {
+                bail!("--confirm is required to consume a reset credit");
+            }
+            let config = load_config(config_path)?;
+            let request_id = request_id.unwrap_or_else(|| {
+                let mut bytes = [0u8; 16];
+                rand::rng().fill_bytes(&mut bytes);
+                URL_SAFE_NO_PAD.encode(bytes)
+            });
+            println!("Reset request ID: {request_id} (reuse this ID if the outcome is unknown)");
+            let result =
+                control::use_reset_credit(&state_dir(&config), &name, &credit_id, &request_id)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
         AccountCommand::Login { name } => login(config_path, &name),
@@ -1252,8 +1337,7 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
     service::while_daemon_stopped(|| {
         login_managed_home_with(path, |path| {
             let status = Command::new("codex")
-                .arg("login")
-                .arg("--device-auth")
+                .args(comradex::accounts::CODEX_DEVICE_LOGIN_ARGS)
                 .env("CODEX_HOME", path)
                 .status()
                 .context("launch codex device login")?;
@@ -1268,7 +1352,9 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
 fn login_managed_home_with(path: &Path, run_login: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     fs::create_dir_all(path)?;
     let _guard = HomeAuthLock::acquire(path)?;
-    run_login(path)
+    run_login(path)?;
+    comradex::auth::validate_existing_login(path)
+        .context("Codex login finished without a readable file-based ChatGPT login")
 }
 
 fn state_dir(config: &Config) -> PathBuf {
@@ -1277,6 +1363,41 @@ fn state_dir(config: &Config) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reset_cli_requires_target_credit_and_explicit_confirmation() {
+        assert!(
+            Cli::try_parse_from([
+                "comradex",
+                "account",
+                "use-reset",
+                "work",
+                "--credit-id",
+                "one"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["comradex", "account", "use-reset", "work", "--confirm"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "comradex",
+                "account",
+                "use-reset",
+                "work",
+                "--credit-id",
+                "one",
+                "--confirm",
+                "--request-id",
+                "stable"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["comradex", "account", "reset-credits", "work", "--json"]).is_ok()
+        );
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 
@@ -1433,6 +1554,10 @@ mod tests {
 
         login_managed_home_with(&home, |child_home| {
             assert!(HomeAuthLock::try_acquire(child_home)?.is_none());
+            fs::write(
+                child_home.join("auth.json"),
+                r#"{"tokens":{"access_token":"test-access-token"}}"#,
+            )?;
             Ok(())
         })
         .unwrap();
@@ -1450,6 +1575,33 @@ mod tests {
 
         assert!(error.to_string().contains("simulated child failure"));
         assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+    }
+
+    #[test]
+    fn managed_login_rejects_success_without_readable_chatgpt_credentials() {
+        for contents in [
+            None,
+            Some("{}"),
+            Some("not-json"),
+            Some(r#"{"OPENAI_API_KEY":"private-test-key"}"#),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("managed");
+            let error = login_managed_home_with(&home, |child_home| {
+                if let Some(contents) = contents {
+                    fs::write(child_home.join("auth.json"), contents)?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("without a readable file-based ChatGPT login")
+            );
+            assert!(!format!("{error:#}").contains("private-test-key"));
+            assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+        }
     }
 
     #[test]

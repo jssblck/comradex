@@ -379,8 +379,17 @@ async fn collect_turn(ws: &mut WebSocketStream<TcpStream>) -> Vec<Value> {
 
 #[tokio::test]
 async fn bridge_materialized_continuation_leaves_exhausted_owner() {
-    for failure in ["http", "sse", "already_exhausted"] {
-        let already_exhausted = failure == "already_exhausted";
+    for failure in [
+        "http",
+        "sse",
+        "already_exhausted",
+        "usage_headers",
+        "usage_poll",
+    ] {
+        let already_exhausted = matches!(
+            failure,
+            "already_exhausted" | "usage_headers" | "usage_poll"
+        );
         let mut scripts = vec![success("resp_a")];
         if !already_exhausted {
             scripts.push(Script {
@@ -400,11 +409,37 @@ async fn bridge_materialized_continuation_leaves_exhausted_owner() {
         let mut ws = fixture.connect().await;
         send_create(&mut ws, None).await;
         assert_eq!(collect_turn(&mut ws).await, success("resp_a").events);
-        if already_exhausted {
-            fixture
-                .router
-                .quota_failure("a", &hyper::HeaderMap::new())
-                .await;
+        match failure {
+            "already_exhausted" => {
+                fixture
+                    .router
+                    .quota_failure("a", &hyper::HeaderMap::new())
+                    .await
+            }
+            "usage_headers" => {
+                fixture
+                    .router
+                    .observe_headers(
+                        "a",
+                        &hyper::HeaderMap::from_iter([(
+                            "x-codex-primary-used-percent".parse().unwrap(),
+                            "100".parse().unwrap(),
+                        )]),
+                    )
+                    .await
+            }
+            "usage_poll" => {
+                // Upstream can still accept paid work. Routing must act on included usage.
+                let snapshot = usage::parse_usage_response(
+                    br#"{"rate_limit":{"primary_window":{"used_percent":100}},"credits":{"has_credits":true,"balance":"1000"}}"#,
+                    chrono::Utc::now().timestamp(),
+                ).unwrap();
+                fixture
+                    .router
+                    .observe_usage_snapshot_for_owner("a", snapshot, &auth::QuotaOwner::default())
+                    .await;
+            }
+            _ => {}
         }
         send_create(&mut ws, Some("resp_a")).await;
         assert_eq!(collect_turn(&mut ws).await, success("resp_b").events);
@@ -457,6 +492,30 @@ async fn bridge_materialized_continuation_leaves_exhausted_owner() {
             assert_eq!(seen[1].body, *body);
         }
     }
+}
+
+#[tokio::test]
+async fn bridge_exhausted_pool_stops_before_dispatch_even_when_upstream_would_accept_credits() {
+    let fixture = Fixture::start_with_members(
+        ResponsesWebsocketMode::HttpBridge,
+        vec![success("resp_a"), success("resp_paid")],
+        &["a", "b"],
+    )
+    .await;
+    let mut ws = fixture.connect().await;
+    send_create(&mut ws, None).await;
+    assert_eq!(collect_turn(&mut ws).await, success("resp_a").events);
+    let headers = hyper::HeaderMap::from_iter([(
+        "x-codex-primary-used-percent".parse().unwrap(),
+        "100".parse().unwrap(),
+    )]);
+    for account in ["a", "b"] {
+        fixture.router.observe_headers(account, &headers).await;
+    }
+    send_create(&mut ws, Some("resp_a")).await;
+    let events = collect_turn(&mut ws).await;
+    assert_eq!(events.last().unwrap()["type"], "error");
+    assert_eq!(fixture.seen.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

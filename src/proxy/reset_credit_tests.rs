@@ -1,465 +1,609 @@
-// Every reset-credit operation in this module targets a loopback mock with synthetic credentials.
-type SeenCreditRequest = (Method, String, hyper::HeaderMap, Value);
-
-struct CreditUpstream {
-    url: String,
-    seen: Arc<AsyncMutex<Vec<SeenCreditRequest>>>,
-    response: Arc<AsyncMutex<(StatusCode, Value)>>,
-    list_status: Arc<AtomicUsize>,
-    spends: Arc<AtomicUsize>,
-    hold: Arc<AtomicBool>,
-    started: Arc<Notify>,
-    release: Arc<Notify>,
-    task: tokio::task::JoinHandle<()>,
+fn reset_credit_token(workspace: &str) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
+        "exp": chrono::Utc::now().timestamp() + 3600,
+        "https://api.openai.com/auth": {"chatgpt_account_id": workspace, "chatgpt_user_id": "reset-test-user"}
+    })).unwrap());
+    format!("e30.{payload}.sig")
 }
 
-impl Drop for CreditUpstream {
+// All credentials and endpoints in these tests are local fixtures. No live reset calls.
+struct ResetCreditFixture {
+    app: Arc<App>,
+    router: Arc<Router>,
+    calls: Arc<Mutex<Vec<(Method, String, serde_json::Value)>>>,
+    server: tokio::task::JoinHandle<()>,
+    home: std::path::PathBuf,
+}
+
+impl Drop for ResetCreditFixture {
     fn drop(&mut self) {
-        self.task.abort();
+        self.server.abort();
     }
 }
 
-impl CreditUpstream {
-    async fn new() -> Self {
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", tcp.local_addr().unwrap());
-        let seen = Arc::new(AsyncMutex::new(Vec::new()));
-        let response = Arc::new(AsyncMutex::new((
-            StatusCode::OK,
-            json!({ "code": "reset" }),
-        )));
-        let list_status = Arc::new(AtomicUsize::new(200));
-        let spends = Arc::new(AtomicUsize::new(0));
-        let hold = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let redeemed = Arc::new(AsyncMutex::new(std::collections::HashSet::new()));
-        let (s, r, l, n, h, st, rel) = (
-            seen.clone(),
-            response.clone(),
-            list_status.clone(),
-            spends.clone(),
-            hold.clone(),
-            started.clone(),
-            release.clone(),
-        );
-        let task = tokio::spawn(async move {
-            let mut connections = JoinSet::new();
-            loop {
-                let (stream, _) = tcp.accept().await.unwrap();
-                let (s, r, l, n, h, st, rel, redeemed) = (
-                    s.clone(),
-                    r.clone(),
-                    l.clone(),
-                    n.clone(),
-                    h.clone(),
-                    st.clone(),
-                    rel.clone(),
-                    redeemed.clone(),
-                );
-                connections.spawn(async move {
-                    let service = service_fn(move |req: Request<Incoming>| {
-                        let (s, r, l, n, h, st, rel, redeemed) =
-                            (s.clone(), r.clone(), l.clone(), n.clone(), h.clone(), st.clone(), rel.clone(), redeemed.clone());
-                        async move {
-                            let (parts, body) = req.into_parts();
-                            let bytes = body.collect().await.unwrap().to_bytes();
-                            let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
-                            let path = parts.uri.path().to_owned();
-                            s.lock().await.push((parts.method.clone(), path.clone(), parts.headers, body.clone()));
-                            let (status, body) = match (parts.method, path.as_str()) {
-                                (Method::GET, "/credits") => (
-                                    StatusCode::from_u16(l.load(Ordering::Relaxed) as u16).unwrap(),
-                                    json!({ "credits": [
-                                        { "id": "credit-ada", "status": "available", "reset_type": "codex_rate_limits", "expires_at": "2100-01-01T00:00:00Z" },
-                                        { "id": "expired", "status": "available", "reset_type": "codex_rate_limits", "expires_at": "2000-01-01T00:00:00Z" },
-                                    ] }),
-                                ),
-                                (Method::GET, "/usage") => (StatusCode::OK, json!({
-                                    "rate_limit": { "primary_window": {
-                                        "used_percent": 2, "limit_window_seconds": 604800, "reset_at": 4102444800_i64,
-                                    } },
-                                })),
-                                (Method::POST, "/credits/consume") => {
-                                    st.notify_one();
-                                    if h.load(Ordering::Relaxed) { rel.notified().await; }
-                                    let (status, mut result) = r.lock().await.clone();
-                                    if status.is_success() && result["code"] == "reset" {
-                                        if redeemed.lock().await.insert(body["redeem_request_id"].as_str().unwrap().to_owned()) {
-                                            n.fetch_add(1, Ordering::Relaxed);
-                                        } else { result = json!({ "code": "already_redeemed" }); }
-                                    }
-                                    (status, result)
-                                }
-                                _ => panic!("unexpected mock request"),
-                            };
-                            Ok::<_, Infallible>(Response::builder().status(status)
-                                .header(CONTENT_TYPE, "application/json").body(json_body(body)).unwrap())
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service).await;
-                });
-            }
-        });
-        Self {
-            url,
-            seen,
-            response,
-            list_status,
-            spends,
-            hold,
-            started,
-            release,
-            task,
-        }
-    }
-}
-
-const REDEEM_ID: &str = "11111111-1111-5111-8111-111111111111";
-
-fn credit_call_body(account: &str) -> Value {
-    json!({
-        "auth_index": account, "method": "POST",
-        "url": format!("{}/consume", reset_credits::CODEX_CREDITS_URL),
-        "header": { "Authorization": "Bearer attacker", "Chatgpt-Account-Id": "wrong-account" },
-        "data": json!({ "credit_id": "credit-ada", "redeem_request_id": REDEEM_ID }).to_string(),
-    })
-}
-
-async fn post_credit(fixture: &Fixture, body: Value) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!("{}/v0/management/api-call", fixture.urls[0]))
-        .bearer_auth(KEY)
-        .header(CONTENT_TYPE, "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .unwrap()
-}
-
-async fn acknowledge_reset(fixture: &Fixture, account: &str) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!("{}/v0/management/reset-quota", fixture.urls[0]))
-        .bearer_auth(KEY)
-        .header(CONTENT_TYPE, "application/json")
-        .body(json!({ "auth_index": account }).to_string())
-        .send()
-        .await
-        .unwrap()
-}
-
-async fn block_codex(fixture: &Fixture) {
-    let headers = hyper::HeaderMap::from_iter([
-        ("retry-after".parse().unwrap(), "3600".parse().unwrap()),
-        (
-            "x-codex-primary-used-percent".parse().unwrap(),
-            "100".parse().unwrap(),
-        ),
-        (
-            "x-codex-primary-reset-at".parse().unwrap(),
-            "4102444800".parse().unwrap(),
-        ),
-    ]);
-    fixture.app.router.quota_failure("ada", &headers).await;
-}
-
-#[tokio::test]
-async fn reset_credits_reads_only_the_selected_account_and_preserves_provider_data() {
-    let upstream = CreditUpstream::new().await;
-    let fixture = Fixture::with_credit_upstream(Some(&upstream.url)).await;
-    let home = fixture.app.config.accounts["ada"].home().unwrap();
+async fn reset_credit_fixture(
+    dir: &std::path::Path,
+    outcome: &'static str,
+    expiry: &'static str,
+) -> ResetCreditFixture {
+    let home = dir.join("managed");
+    fs::create_dir_all(&home).unwrap();
     fs::write(
         home.join("auth.json"),
-        json!({
-            "tokens": { "access_token": "test-codex-secret", "account_id": "ada-account" },
-        })
-        .to_string(),
+        serde_json::to_vec(&serde_json::json!({"tokens": {
+            "access_token": reset_credit_token("workspace-a"),
+            "refresh_token": "fixture-refresh", "account_id": "workspace-a"
+        }}))
+        .unwrap(),
     )
     .unwrap();
-    let before = fixture.app.router.routing_snapshot().await;
-    let response = json_response(
-        fixture
-            .call("ada", "GET", reset_credits::CODEX_CREDITS_URL)
-            .await,
+    let (mut app, _, router) = managed_direct_test_app(dir, &home);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    Arc::get_mut(&mut app).unwrap().usage_url = format!(
+        "http://{}/backend-api/wham/usage",
+        listener.local_addr().unwrap()
     )
-    .await;
-    assert_eq!(response["status_code"], 200);
-    let body: Value = serde_json::from_str(response["body"].as_str().unwrap()).unwrap();
-    assert_eq!(body["credits"].as_array().unwrap().len(), 2);
-    assert_eq!(body["credits"][0]["id"], "credit-ada");
-    let seen = upstream.seen.lock().await;
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].0, Method::GET);
-    assert_eq!(seen[0].2[AUTHORIZATION], "Bearer test-codex-secret");
-    assert_eq!(seen[0].2["chatgpt-account-id"], "ada-account");
-    assert_eq!(seen[0].2["originator"], "Codex Desktop");
-    assert_eq!(upstream.spends.load(Ordering::Relaxed), 0);
-    assert_eq!(before, fixture.app.router.routing_snapshot().await);
-    fixture.app.shutdown_connections().await;
-}
-
-#[tokio::test]
-async fn reset_credit_confirmation_clears_only_quota_and_retries_keep_the_same_id() {
-    let upstream = CreditUpstream::new().await;
-    let fixture = Fixture::with_credit_upstream(Some(&upstream.url)).await;
-    fixture
-        .app
-        .router
-        .set_preferred("codex", Some("ada".into()))
-        .await;
-    fixture
-        .app
-        .router
-        .set_preserved("claude", Some("anna".into()))
-        .await;
-    fixture
-        .observe(
-            "ada",
-            &[("primary", Some(100), Some(604800), Some(4102444800))],
-        )
-        .await;
-    block_codex(&fixture).await;
-    assert_eq!(
-        acknowledge_reset(&fixture, "ada").await.status(),
-        StatusCode::CONFLICT
-    );
-    assert_eq!(upstream.spends.load(Ordering::Relaxed), 0);
-    let result = json_response(post_credit(&fixture, credit_call_body("ada")).await).await;
-    assert_eq!(result["status_code"], 200);
-    assert_eq!(
-        serde_json::from_str::<Value>(result["body"].as_str().unwrap()).unwrap()["code"],
-        "reset"
-    );
-    assert_eq!(
-        acknowledge_reset(&fixture, "ada").await.status(),
-        StatusCode::OK
-    );
-    let state = fixture.app.router.routing_snapshot().await;
-    assert!(state.account_states["ada"].available);
-    assert_eq!(
-        state.account_states["ada"].usage_windows["primary"].used_percent,
-        Some(2)
-    );
-    assert_eq!(state.preferred_accounts["codex"], "ada");
-    assert_eq!(state.preserved_accounts["claude"], "anna");
-
-    // An old receipt cannot clear a subsequent block.
-    block_codex(&fixture).await;
-    let result = json_response(post_credit(&fixture, credit_call_body("ada")).await).await;
-    assert_eq!(
-        serde_json::from_str::<Value>(result["body"].as_str().unwrap()).unwrap()["code"],
-        "already_redeemed"
-    );
-    assert_eq!(
-        acknowledge_reset(&fixture, "ada").await.status(),
-        StatusCode::CONFLICT
-    );
-    assert_eq!(upstream.spends.load(Ordering::Relaxed), 1);
-    for (_, _, headers, body) in upstream
-        .seen
-        .lock()
-        .await
-        .iter()
-        .filter(|r| r.0 == Method::POST)
-    {
-        assert_eq!(body["redeem_request_id"], REDEEM_ID);
-        assert_eq!(headers[AUTHORIZATION], "Bearer test-codex-secret");
-        assert!(!headers.contains_key("chatgpt-account-id"));
-    }
-    fixture.app.shutdown_connections().await;
-}
-
-#[tokio::test]
-async fn reset_credit_failures_and_malformed_outcomes_never_clear_quota_or_retry() {
-    let upstream = CreditUpstream::new().await;
-    let fixture = Fixture::with_credit_upstream(Some(&upstream.url)).await;
-    for (status, body, expected_status) in [
-        (StatusCode::OK, json!({ "code": "nothing_to_reset" }), 200),
-        (StatusCode::OK, json!({ "code": "no_credit" }), 200),
-        (StatusCode::OK, json!({ "code": "already_redeemed" }), 200),
-        (StatusCode::OK, json!({ "code": "unknown" }), 502),
-        (StatusCode::UNAUTHORIZED, json!({}), 401),
-        (StatusCode::TOO_MANY_REQUESTS, json!({}), 429),
-        (StatusCode::INTERNAL_SERVER_ERROR, json!({}), 500),
-    ] {
-        *upstream.response.lock().await = (status, body);
-        block_codex(&fixture).await;
-        let before = upstream.seen.lock().await.len();
-        let response = json_response(post_credit(&fixture, credit_call_body("ada")).await).await;
-        assert_eq!(response["status_code"], expected_status);
-        assert_eq!(upstream.seen.lock().await.len(), before + 1);
-        assert_eq!(
-            fixture.app.router.routing_snapshot().await.account_states["ada"]
-                .unavailable_reason
-                .as_deref(),
-            Some("quota")
-        );
-    }
-    upstream.list_status.store(429, Ordering::Relaxed);
-    let response = json_response(
-        fixture
-            .call("ada", "GET", reset_credits::CODEX_CREDITS_URL)
-            .await,
-    )
-    .await;
-    assert_eq!(response["status_code"], 429);
-    assert_eq!(upstream.spends.load(Ordering::Relaxed), 0);
-    fixture.app.shutdown_connections().await;
-}
-
-#[tokio::test]
-async fn reset_credit_validation_rejects_wrong_providers_and_bad_inputs_before_dispatch() {
-    let upstream = CreditUpstream::new().await;
-    let fixture = Fixture::with_credit_upstream(Some(&upstream.url)).await;
-    for account in ["unknown", "inbound", "grace"] {
-        assert!(
-            post_credit(&fixture, credit_call_body(account))
-                .await
-                .status()
-                .is_client_error()
-        );
-    }
-    for data in [
-        None, Some("{}".into()), Some("not-json".into()),
-        Some(json!({ "credit_id": "", "redeem_request_id": REDEEM_ID }).to_string()),
-        Some(json!({ "credit_id": "credit-ada", "redeem_request_id": "invalid" }).to_string()),
-        Some(json!({ "credit_id": "credit-ada", "redeem_request_id": REDEEM_ID, "account_id": "other" }).to_string()),
-    ] {
-        let mut body = credit_call_body("ada");
-        body["data"] = json!(data);
-        assert_eq!(post_credit(&fixture, body).await.status(), StatusCode::BAD_REQUEST);
-    }
-    let mut body = credit_call_body("ada");
-    body["url"] = json!(format!(
-        "{}/consume?unexpected=1",
-        reset_credits::CODEX_CREDITS_URL
-    ));
-    assert_eq!(
-        post_credit(&fixture, body.clone()).await.status(),
-        StatusCode::BAD_REQUEST
-    );
-    body["url"] = json!(format!("{}/consume", reset_credits::CODEX_CREDITS_URL));
-    body["method"] = json!("GET");
-    assert_eq!(
-        post_credit(&fixture, body).await.status(),
-        StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        acknowledge_reset(&fixture, "grace").await.status(),
-        StatusCode::NOT_FOUND
-    );
-    assert!(upstream.seen.lock().await.is_empty());
-    fixture.app.shutdown_connections().await;
-}
-
-#[tokio::test]
-async fn reset_credit_response_cannot_clear_a_newer_rejection_or_replacement_identity() {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    for change_identity in [false, true] {
-        let upstream = CreditUpstream::new().await;
-        upstream.hold.store(true, Ordering::Relaxed);
-        let fixture = Fixture::with_credit_upstream(Some(&upstream.url)).await;
-        let home = fixture.app.config.accounts["ada"].home().unwrap();
-        let write_identity = |name: &str| {
-            let claims = json!({
-                "exp": 4102444800_i64,
-                "https://api.openai.com/auth": { "chatgpt_account_id": name, "chatgpt_user_id": "ada-user" },
+    .parse()
+    .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let consumed = Arc::new(AtomicBool::new(false));
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let recorded = recorded.clone();
+            let consumed = consumed.clone();
+            tokio::spawn(async move {
+                let handler = service_fn(move |request: Request<Incoming>| {
+                    let recorded = recorded.clone();
+                    let consumed = consumed.clone();
+                    async move {
+                        assert_eq!(request.headers()["chatgpt-account-id"], "workspace-a");
+                        assert!(
+                            request.headers()[AUTHORIZATION]
+                                .to_str()
+                                .unwrap()
+                                .starts_with("Bearer e30.")
+                        );
+                        let method = request.method().clone();
+                        let path = request.uri().path().to_owned();
+                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                        let body = if bytes.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::from_slice(&bytes).unwrap()
+                        };
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push((method.clone(), path.clone(), body));
+                        let already_consumed = consumed.load(Ordering::SeqCst);
+                        let available_count = if already_consumed { 0 } else { 1 };
+                        let mut status = StatusCode::OK;
+                        let response = match path.as_str() {
+                            "/backend-api/wham/rate-limit-reset-credits/consume" => {
+                                assert_eq!(method, Method::POST);
+                                if outcome == "failed_before_consumption"
+                                    && recorded
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .filter(|(method, _, _)| *method == Method::POST)
+                                        .count()
+                                        == 1
+                                {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionAborted,
+                                        "fixture failed before consuming the credit",
+                                    ));
+                                }
+                                if matches!(outcome, "lost_response" | "lost_missing_credit") {
+                                    consumed.store(true, Ordering::SeqCst);
+                                    if !already_consumed {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::ConnectionAborted,
+                                            "fixture consumed the credit but lost its response",
+                                        ));
+                                    }
+                                }
+                                if outcome == "http_error" {
+                                    status = StatusCode::INTERNAL_SERVER_ERROR;
+                                }
+                                let code = match outcome {
+                                    "refresh_error" | "failed_before_consumption" => "reset",
+                                    "lost_response" | "lost_missing_credit" => "already_redeemed",
+                                    _ => outcome,
+                                };
+                                if code == "reset" || code == "already_redeemed" {
+                                    consumed.store(true, Ordering::SeqCst);
+                                }
+                                serde_json::json!({"code": code})
+                            }
+                            "/backend-api/wham/usage" => {
+                                assert_eq!(method, Method::GET);
+                                if outcome == "refresh_error" && already_consumed {
+                                    status = StatusCode::SERVICE_UNAVAILABLE;
+                                }
+                                serde_json::json!({
+                                    "rate_limit": {"primary_window": {
+                                        "used_percent": if already_consumed { 0 } else { 100 },
+                                        "reset_at": 4102444800_i64,
+                                        "limit_window_seconds": 604800
+                                    }},
+                                    "rate_limit_reset_credits": {"available_count": available_count}
+                                })
+                            }
+                            "/backend-api/wham/rate-limit-reset-credits" => {
+                                assert_eq!(method, Method::GET);
+                                if outcome == "details_error" {
+                                    status = StatusCode::SERVICE_UNAVAILABLE;
+                                }
+                                let credits = if already_consumed
+                                    && outcome == "lost_missing_credit"
+                                {
+                                    serde_json::json!([])
+                                } else {
+                                    serde_json::json!([{
+                                        "id": "credit-one",
+                                        "reset_type": "codex_rate_limits",
+                                        "status": if already_consumed { "consumed" } else { "available" },
+                                        "granted_at": "2026-10-01T01:02:03.456Z",
+                                        "expires_at": expiry,
+                                        "title": "Full reset"
+                                    }])
+                                };
+                                serde_json::json!({
+                                    "available_count": available_count,
+                                    "credits": credits
+                                })
+                            }
+                            _ => panic!("unexpected fixture request: {path}"),
+                        };
+                        Ok::<_, std::io::Error>(
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::from(response.to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), handler)
+                    .await;
             });
-            fs::write(home.join("auth.json"), json!({
-                "tokens": { "access_token": format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims.to_string())), "account_id": name },
-            }).to_string()).unwrap();
-        };
-        write_identity("original-account");
-        block_codex(&fixture).await;
-        let pending = post_credit(&fixture, credit_call_body("ada"));
-        let change = async {
-            upstream.started.notified().await;
-            if change_identity {
-                write_identity("replacement-account");
-            }
-            block_codex(&fixture).await;
-            upstream.release.notify_one();
-        };
-        let (response, ()) = tokio::join!(pending, change);
-        assert_eq!(json_response(response).await["status_code"], 200);
-        assert_eq!(
-            fixture.app.router.routing_snapshot().await.account_states["ada"]
-                .unavailable_reason
-                .as_deref(),
-            Some("quota")
-        );
-        assert_eq!(upstream.spends.load(Ordering::Relaxed), 1);
-        fixture.app.shutdown_connections().await;
+        }
+    });
+    ResetCreditFixture {
+        app,
+        router,
+        calls,
+        server,
+        home,
     }
 }
 
 #[tokio::test]
-async fn claude_reset_data_is_cached_account_scoped_and_returned_without_redemption() {
-    let fixture = Fixture::new().await;
-    let home = fixture.app.config.accounts["grace"].home().unwrap();
-    let credentials = crate::claude::auth::read(home).unwrap();
-    let block = json!({
-        "eligible": true, "next_grant_id": "grant_grace",
-        "grants": [{ "id": "grant_grace", "resets_left": 2, "ends_at": "2100-01-01T00:00:00Z", "paused": false, "usable_now": true }],
-    });
-    fixture
-        .observe("grace", &[("5h", Some(15), Some(18000), Some(4102444800))])
-        .await;
-    fixture
-        .observe("anna", &[("5h", Some(25), Some(18000), Some(4102444800))])
-        .await;
-    fixture
-        .app
-        .observe_claude_reset_credits(
-            "grace",
-            credentials.owner(),
-            json!({ "cedar_ember": block }).to_string().as_bytes(),
-        )
-        .await;
-    for url in [
-        CLAUDE_URL.to_owned(),
-        format!("{CLAUDE_URL}?cedar_ember=1&skip_spend=1"),
-    ] {
-        let body = usage_body(fixture.call("grace", "GET", &url).await).await;
-        assert_eq!(body["cedar_ember"], block);
-        assert_eq!(body["five_hour"]["utilization"], 15);
-    }
-    let other = usage_body(fixture.call("anna", "GET", CLAUDE_URL).await).await;
-    assert!(other.get("cedar_ember").is_none());
-    fixture
-        .app
-        .observe_claude_reset_credits("grace", credentials.owner(), b"{}")
-        .await;
+async fn reset_credits_poll_is_read_only_and_keeps_precise_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "reset", "2100-01-01T01:02:03.456+02:00").await;
     assert!(
-        usage_body(fixture.call("grace", "GET", CLAUDE_URL).await)
-            .await
-            .get("cedar_ember")
-            .is_none()
-    );
-    fixture
-        .app
-        .observe_claude_reset_credits(
-            "grace",
-            credentials.owner(),
-            json!({ "cedar_ember": block }).to_string().as_bytes(),
-        )
-        .await;
-    let mut replaced = credentials;
-    replaced.account_uuid = "33333333-3333-4333-8333-333333333333".into();
-    fs::write(
-        home.join("claude-auth.json"),
-        serde_json::to_vec(&replaced).unwrap(),
-    )
-    .unwrap();
-    assert!(fixture.app.claude_reset_credits("grace").await.is_none());
-    assert_eq!(
         fixture
             .app
-            .stats
-            .usage_fetch_accounts_checked
-            .load(Ordering::Relaxed),
+            .refresh_managed_usage_at(chrono::Utc::now().timestamp() as u64)
+            .await
+    );
+    let state = fixture.router.routing_snapshot().await;
+    let credits = state.account_states["a"].reset_credits.as_ref().unwrap();
+    assert_eq!(credits.available_count, 1);
+    assert_eq!(
+        credits.credits.as_ref().unwrap()[0].expires_at.as_deref(),
+        Some("2100-01-01T01:02:03.456+02:00")
+    );
+    assert!(
+        fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
+    // A newly signed-in identity must never inherit another identity's credits.
+    let auth_path = fixture.home.join("auth.json");
+    let mut auth: serde_json::Value =
+        serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
+    auth["tokens"]["account_id"] = "replacement-workspace".into();
+    auth["tokens"]["access_token"] = reset_credit_token("replacement-workspace").into();
+    fs::write(auth_path, serde_json::to_vec(&auth).unwrap()).unwrap();
+    assert!(
+        fixture.router.routing_snapshot().await.account_states["a"]
+            .reset_credits
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn reset_credit_detail_failure_preserves_usage_and_reports_unknown_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "details_error", "2100-01-01T00:00:00Z").await;
+    let credits = fixture.app.read_reset_credits("a").await.unwrap();
+    assert_eq!(credits.available_count, 1);
+    assert!(credits.credits.is_none());
+    assert!(credits.error.unwrap().contains("503"));
+    assert_eq!(
+        fixture.router.routing_snapshot().await.account_states["a"].usage_percent,
+        Some(100)
+    );
+}
+
+#[tokio::test]
+async fn reset_credit_expired_or_wrong_account_never_posts() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "reset", "2000-01-01T00:00:00Z").await;
+    for account in ["a", "b", "missing"] {
+        assert!(
+            fixture
+                .app
+                .use_reset_credit(account, "credit-one", "request-one")
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
+}
+
+#[tokio::test]
+async fn reset_credit_control_requires_confirmation_and_refreshes_after_targeted_post() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "reset", "2100-01-01T00:00:00Z").await;
+    let mut exhausted = hyper::HeaderMap::new();
+    exhausted.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+    exhausted.insert("x-codex-primary-reset-at", "4102444800".parse().unwrap());
+    fixture.router.quota_failure("a", &exhausted).await;
+    assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+    let state = dir.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    let server = crate::control::ControlServer::bind(
+        &state,
+        dir.path().join("config.toml"),
+        fixture.app.config.clone(),
+        fixture.router.clone(),
+        fixture.app.stats.clone(),
+    )
+    .unwrap()
+    .with_app(fixture.app.clone());
+    let worker = tokio::spawn(server.run());
+    let mut stream = tokio::net::UnixStream::connect(crate::control::socket_path(&state))
+        .await
+        .unwrap();
+    stream.write_all(b"{\"command\":\"ui_use_reset_credit\",\"account\":\"a\",\"credit_id\":\"credit-one\",\"request_id\":\"request-one\",\"confirm\":false}\n").await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response).unwrap()["ok"],
+        false
+    );
+    assert!(fixture.calls.lock().unwrap().is_empty());
+    let result = tokio::task::spawn_blocking(move || {
+        crate::control::use_reset_credit(&state, "a", "credit-one", "request-one")
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.code, crate::reset_credits::ResetOutcome::Reset);
+    assert!(result.refresh_error.is_none());
+    let snapshot = fixture.router.routing_snapshot().await;
+    assert_eq!(snapshot.account_states["a"].usage_percent, Some(0));
+    assert!(snapshot.account_states["a"].available);
+    assert_eq!(
+        snapshot.account_states["a"]
+            .reset_credits
+            .as_ref()
+            .unwrap()
+            .available_count,
         0
     );
-    fixture.app.shutdown_connections().await;
+    let calls = fixture.calls.lock().unwrap();
+    let posts: Vec<_> = calls
+        .iter()
+        .filter(|(method, _, _)| *method == Method::POST)
+        .collect();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        posts[0].2,
+        serde_json::json!({"credit_id": "credit-one", "redeem_request_id": "request-one"})
+    );
+    worker.abort();
+}
+
+#[tokio::test]
+async fn reset_credit_outcomes_are_distinct_and_failed_posts_are_not_retried() {
+    for outcome in [
+        "nothing_to_reset",
+        "no_credit",
+        "already_redeemed",
+        "http_error",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = reset_credit_fixture(dir.path(), outcome, "2100-01-01T00:00:00Z").await;
+        let result = fixture
+            .app
+            .use_reset_credit("a", "credit-one", "stable-request")
+            .await;
+        if outcome == "http_error" {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(
+                serde_json::to_value(result.unwrap()).unwrap()["code"],
+                outcome
+            );
+        }
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _, _)| *method == Method::POST)
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn reset_credit_success_survives_followup_refresh_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "refresh_error", "2100-01-01T00:00:00Z").await;
+    let result = fixture
+        .app
+        .use_reset_credit("a", "credit-one", "request-one")
+        .await
+        .unwrap();
+    assert_eq!(result.code, crate::reset_credits::ResetOutcome::Reset);
+    assert!(result.refresh_error.unwrap().contains("503"));
+    assert_eq!(
+        fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| *method == Method::POST)
+            .count(),
+        1
+    );
+    assert!(
+        fixture.router.routing_snapshot().await.account_states["a"]
+            .reset_credits
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn reset_credit_cannot_race_an_in_progress_usage_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "reset", "2100-01-01T00:00:00Z").await;
+    let _refresh = fixture.app.usage_locks["a"].lock().await;
+    assert!(
+        fixture
+            .app
+            .use_reset_credit("a", "credit-one", "request-one")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("in progress")
+    );
+    assert!(fixture.calls.lock().unwrap().is_empty());
+}
+
+async fn mark_reset_credit_fixture_exhausted(fixture: &ResetCreditFixture) {
+    let mut exhausted = hyper::HeaderMap::new();
+    exhausted.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+    exhausted.insert("x-codex-primary-reset-at", "4102444800".parse().unwrap());
+    fixture.router.quota_failure("a", &exhausted).await;
+    assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+}
+
+#[tokio::test]
+async fn reset_credit_lost_response_reconciles_consumed_or_missing_credit() {
+    for outcome in ["lost_response", "lost_missing_credit"] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = reset_credit_fixture(dir.path(), outcome, "2100-01-01T00:00:00Z").await;
+        mark_reset_credit_fixture_exhausted(&fixture).await;
+        assert!(
+            fixture
+                .app
+                .use_reset_credit("a", "credit-one", "original-request")
+                .await
+                .is_err()
+        );
+
+        // Ordinary polling sees the consumed credit and recovered usage, but the
+        // unchanged deadline cannot release the original hard quota block.
+        assert_eq!(
+            fixture
+                .app
+                .read_reset_credits("a")
+                .await
+                .unwrap()
+                .available_count,
+            0
+        );
+        assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _, _)| *method == Method::POST)
+                .count(),
+            1
+        );
+
+        let result = fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .unwrap();
+        assert_eq!(
+            result.code,
+            crate::reset_credits::ResetOutcome::AlreadyRedeemed
+        );
+        assert!(fixture.router.routing_snapshot().await.account_states["a"].available);
+        let posts: Vec<_> = fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| *method == Method::POST)
+            .map(|(_, _, body)| body.clone())
+            .collect();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0], posts[1]);
+
+        // A local response can also be lost. Replaying a confirmed result must
+        // neither POST again nor erase quota exhaustion observed after success.
+        mark_reset_credit_fixture_exhausted(&fixture).await;
+        let cached = fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .unwrap();
+        assert_eq!(
+            cached.code,
+            crate::reset_credits::ResetOutcome::AlreadyRedeemed
+        );
+        assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _, _)| *method == Method::POST)
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn reset_credit_late_confirmation_preserves_newer_quota_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "lost_response", "2100-01-01T00:00:00Z").await;
+    mark_reset_credit_fixture_exhausted(&fixture).await;
+    assert!(
+        fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .is_err()
+    );
+    mark_reset_credit_fixture_exhausted(&fixture).await;
+    let result = fixture
+        .app
+        .use_reset_credit("a", "credit-one", "original-request")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.code,
+        crate::reset_credits::ResetOutcome::AlreadyRedeemed
+    );
+    assert!(!fixture.router.routing_snapshot().await.account_states["a"].available);
+}
+
+#[tokio::test]
+async fn reset_credit_retry_that_performs_reset_clears_intervening_quota_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(
+        dir.path(),
+        "failed_before_consumption",
+        "2100-01-01T00:00:00Z",
+    )
+    .await;
+    mark_reset_credit_fixture_exhausted(&fixture).await;
+    assert!(
+        fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .is_err()
+    );
+    mark_reset_credit_fixture_exhausted(&fixture).await;
+    let result = fixture
+        .app
+        .use_reset_credit("a", "credit-one", "original-request")
+        .await
+        .unwrap();
+    assert_eq!(result.code, crate::reset_credits::ResetOutcome::Reset);
+    assert!(fixture.router.routing_snapshot().await.account_states["a"].available);
+    let posts: Vec<_> = fixture
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _, _)| *method == Method::POST)
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[0], posts[1]);
+}
+
+#[tokio::test]
+async fn reset_credit_retry_cannot_change_request_credit_or_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "lost_response", "2100-01-01T00:00:00Z").await;
+    assert!(
+        fixture
+            .app
+            .use_reset_credit("a", "credit-one", "original-request")
+            .await
+            .is_err()
+    );
+    for (credit, request) in [
+        ("credit-other", "original-request"),
+        ("credit-one", "new-request"),
+    ] {
+        assert!(
+            fixture
+                .app
+                .use_reset_credit("a", credit, request)
+                .await
+                .is_err()
+        );
+    }
+    let auth_path = fixture.home.join("auth.json");
+    let mut auth: serde_json::Value =
+        serde_json::from_slice(&fs::read(&auth_path).unwrap()).unwrap();
+    auth["tokens"]["account_id"] = "replacement-workspace".into();
+    auth["tokens"]["access_token"] = reset_credit_token("replacement-workspace").into();
+    fs::write(auth_path, serde_json::to_vec(&auth).unwrap()).unwrap();
+    let error = fixture
+        .app
+        .use_reset_credit("a", "credit-one", "original-request")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("original account identity and credit")
+    );
+    assert_eq!(
+        fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _, _)| *method == Method::POST)
+            .count(),
+        1
+    );
 }

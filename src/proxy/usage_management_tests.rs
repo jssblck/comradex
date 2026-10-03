@@ -112,7 +112,6 @@ impl Fixture {
         let mut app = App::new(config, router, Arc::new(Stats::default())).unwrap();
         if let Some(upstream) = upstream {
             let app = Arc::get_mut(&mut app).unwrap();
-            app.reset_credits.codex_url = format!("{upstream}/credits").parse().unwrap();
             app.usage_url = format!("{upstream}/usage").parse().unwrap();
         }
         let mut fixture = Self {
@@ -151,6 +150,7 @@ impl Fixture {
             .observe_usage_snapshot_for_owner(
                 name,
                 UsageSnapshot {
+                    reset_credits_available: None,
                     observed_at_unix: 1788800000,
                     windows: windows
                         .iter()
@@ -526,4 +526,4 @@ async fn management_exposes_only_matching_account_metadata_for_client_deduplicat
     fixture.app.shutdown_connections().await;
 }
 
-include!("reset_credit_tests.rs");
+include!("management_reset_credit_tests.rs");
