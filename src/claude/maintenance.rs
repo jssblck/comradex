@@ -1,4 +1,4 @@
-//! Authoritative Claude quota observations and durable reset-warming reservations.
+//! Claude quota observations, reporting metadata, and durable reset-warming reservations.
 use crate::{routing::QuotaWindowStatus, usage::UsageSnapshot};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,25 @@ pub fn parse_usage(bytes: &[u8], now: u64) -> Result<UsageSnapshot> {
         observed_at_unix: now.min(i64::MAX as u64) as i64,
         windows,
     })
+}
+
+/// Fable is reporting metadata, never an account-wide routing or warming limit.
+pub fn parse_fable_usage(bytes: &[u8]) -> Option<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let window = body.get("seven_day_fable")?;
+    let utilization = window.get("utilization")?;
+    utilization
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= 100.0)?;
+    let reset = match window.get("resets_at") {
+        Some(serde_json::Value::String(at)) => {
+            chrono::DateTime::parse_from_rfc3339(at).ok()?;
+            serde_json::Value::String(at.clone())
+        }
+        Some(serde_json::Value::Null) | None => serde_json::Value::Null,
+        _ => return None,
+    };
+    Some(serde_json::json!({ "utilization": utilization, "resets_at": reset }))
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -213,6 +232,86 @@ mod tests {
         ] {
             assert!(parse_usage(bytes, 100).is_err());
         }
+    }
+
+    #[test]
+    fn fable_reporting_preserves_utilization_and_optional_resets() {
+        for percent in [0.0, 25.5, 99.9, 100.0] {
+            for reset in [
+                serde_json::json!("2026-10-03T12:34:56.789-07:00"),
+                serde_json::Value::Null,
+            ] {
+                let payload = serde_json::json!({
+                    "seven_day_fable": { "utilization": percent, "resets_at": reset, "extra": "ignored" }
+                });
+                assert_eq!(
+                    parse_fable_usage(payload.to_string().as_bytes()),
+                    Some(serde_json::json!({ "utilization": percent, "resets_at": reset }))
+                );
+            }
+        }
+        assert_eq!(
+            parse_fable_usage(br#"{"seven_day_fable":{"utilization":0}}"#),
+            Some(serde_json::json!({ "utilization": 0, "resets_at": null }))
+        );
+    }
+
+    #[test]
+    fn invalid_or_absent_fable_metadata_does_not_discard_shared_usage() {
+        for window in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!(50),
+            serde_json::json!({}),
+            serde_json::json!({ "utilization": null }),
+            serde_json::json!({ "utilization": "50" }),
+            serde_json::json!({ "utilization": -1 }),
+            serde_json::json!({ "utilization": 100.1 }),
+            serde_json::json!({ "utilization": 50, "resets_at": false }),
+            serde_json::json!({ "utilization": 50, "resets_at": 123 }),
+            serde_json::json!({ "utilization": 50, "resets_at": "not-a-date" }),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "five_hour": { "utilization": 25 }, "seven_day": null, "seven_day_fable": window
+            }))
+            .unwrap();
+            assert!(parse_fable_usage(&bytes).is_none());
+            let snapshot = parse_usage(&bytes, 100).unwrap();
+            assert_eq!(snapshot.windows.len(), 2);
+            assert_eq!(snapshot.windows["5h"].used_percent, Some(25));
+        }
+        let bytes = br#"{"five_hour":null,"seven_day":null}"#;
+        assert!(parse_fable_usage(bytes).is_none());
+        assert!(parse_usage(bytes, 100).is_ok());
+        assert!(parse_fable_usage(b"not-json").is_none());
+    }
+
+    #[test]
+    fn fable_resets_and_exhaustion_do_not_authorize_or_block_shared_warming() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = ActivationLedger::open(dir.path().join("warm.json")).unwrap();
+        let fable_reset = parse_usage(
+            br#"{
+            "five_hour":null,"seven_day":null,
+            "seven_day_fable":{"utilization":100,"resets_at":"1970-01-01T00:01:40Z"}
+        }"#,
+            101,
+        )
+        .unwrap();
+        assert_eq!(ledger.observe("grace", &fable_reset, 101).unwrap(), None);
+        let shared_reset = parse_usage(
+            br#"{
+            "five_hour":{"utilization":100,"resets_at":"1970-01-01T00:01:40Z"},"seven_day":null,
+            "seven_day_fable":{"utilization":100,"resets_at":"2100-01-01T00:00:00Z"}
+        }"#,
+            101,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.observe("ada", &shared_reset, 101).unwrap(),
+            Some(100)
+        );
     }
     #[test]
     fn claude_warming_waits_for_reset_and_deduplicates_across_restart() {

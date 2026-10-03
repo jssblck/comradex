@@ -121,6 +121,13 @@ Quota windows use Comradex's latest observations. The response's
 time as Unix seconds. Accounts awaiting usage or sign-in return an unavailable
 result. Token credentials are never returned.
 
+Claude responses also include provider-reported `seven_day_fable` utilization
+and reset time from the latest successful background poll. This model-specific
+window is reporting data only; it does not affect shared-quota routing, failover,
+or reset warming. Missing, null, or malformed Fable windows are omitted without
+discarding valid shared usage. A valid utilization with no reset time reports
+`resets_at: null`. Cached Fable data stays tied to the managed account identity.
+
 Codex reset-credit reads fetch the selected account's current provider data.
 To redeem a reset, a client POSTs to the consume URL with `credit_id` and a UUID
 `redeem_request_id` in `data`. Keep the same request ID when retrying an
