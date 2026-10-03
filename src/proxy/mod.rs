@@ -381,8 +381,55 @@ where
 #[derive(Debug, Clone)]
 struct HttpBridgeContinuation {
     response_id: String,
-    input: Vec<serde_json::Value>,
+    input: HttpBridgeInput,
     output: Vec<serde_json::Value>,
+    _output_memory: Vec<Arc<crate::memory::Reservation>>,
+}
+
+#[derive(Debug, Clone)]
+struct HttpBridgeInput(Arc<HttpBridgeInputData>);
+
+#[derive(Debug)]
+struct HttpBridgeInputData {
+    values: Vec<serde_json::Value>,
+    memory: Option<crate::memory::Reservation>,
+}
+
+struct HttpBridgeRetryFrame {
+    value: serde_json::Value,
+    _memory: crate::memory::Reservation,
+}
+
+impl HttpBridgeInput {
+    fn measured(values: Vec<serde_json::Value>, memory: crate::memory::Reservation) -> Self {
+        Self(Arc::new(HttpBridgeInputData {
+            values,
+            memory: memory.is_tracked().then_some(memory),
+        }))
+    }
+
+    fn retain(&self) {
+        if let Some(memory) = &self.0.memory {
+            memory.retain_as_continuation();
+        }
+    }
+
+    fn into_values(self) -> Vec<serde_json::Value> {
+        match Arc::try_unwrap(self.0) {
+            Ok(data) => data.values,
+            Err(data) => data.values.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<serde_json::Value>> for HttpBridgeInput {
+    fn from(values: Vec<serde_json::Value>) -> Self {
+        Self(Arc::new(HttpBridgeInputData {
+            values,
+            memory: None,
+        }))
+    }
 }
 
 fn has_suffix_prefix_overlap<T: PartialEq>(prefix: &[T], incoming: &[T]) -> bool {
@@ -423,7 +470,7 @@ fn materialize_http_bridge_continuation(
     cached: HttpBridgeContinuation,
     incoming: Vec<serde_json::Value>,
 ) -> std::result::Result<Vec<serde_json::Value>, &'static str> {
-    let mut prefix = cached.input;
+    let mut prefix = cached.input.into_values();
     prefix.extend(cached.output);
     if prefix.len() > HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS
         || incoming.len() > HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS
@@ -471,9 +518,10 @@ struct CapacityObservation(Arc<AtomicBool>);
 struct HttpBridgeCapture {
     quota_owner: auth::QuotaOwner,
     capacity_observation: CapacityObservation,
-    input: Vec<serde_json::Value>,
+    input: HttpBridgeInput,
     response_id: Option<String>,
     output: Vec<serde_json::Value>,
+    output_memory: Vec<Arc<crate::memory::Reservation>>,
     delivered_event: bool,
     response_created: bool,
     progress_events: u64,
@@ -548,7 +596,11 @@ impl HttpBridgeCapture {
             == Some("response.output_item.done")
             && let Some(item) = event.get("item")
         {
-            self.output.push(item.clone());
+            let (item, memory) = crate::memory::measure(false, || item.clone());
+            self.output.push(item);
+            if memory.is_tracked() {
+                self.output_memory.push(Arc::new(memory));
+            }
         }
     }
 }
@@ -2422,8 +2474,10 @@ impl App {
                     break;
                 }
                 Message::Text(text) => {
-                    let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(text.as_str())
-                    else {
+                    let (frame, frame_memory) = crate::memory::measure(false, || {
+                        serde_json::from_str::<serde_json::Value>(text.as_str())
+                    });
+                    let Ok(mut frame) = frame else {
                         send_ws_error(&control, "invalid_request_error", "invalid JSON frame")
                             .await;
                         continue;
@@ -2480,7 +2534,9 @@ impl App {
                         .filter(|value| !value.is_empty())
                         .map(str::to_owned);
                     if let Some(anchor) = routing_previous_response_id.as_deref() {
-                        let cached = continuation.lock().expect("bridge continuation").clone();
+                        let (cached, _cached_memory) = crate::memory::measure(false, || {
+                            continuation.lock().expect("bridge continuation").clone()
+                        });
                         let Some(cached) = cached.filter(|cached| cached.response_id == anchor)
                         else {
                             let error = previous_response_not_found_error();
@@ -2519,17 +2575,13 @@ impl App {
                     }
                     object.remove("type");
                     object.insert("stream".into(), serde_json::Value::Bool(true));
-                    let request_input = object
-                        .get("input")
-                        .and_then(serde_json::Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut retry_frame = frame.clone();
-                    retry_frame["type"] = serde_json::Value::String("response.create".into());
-                    if let Some(anchor) = &routing_previous_response_id {
-                        retry_frame["previous_response_id"] =
-                            serde_json::Value::String(anchor.clone());
-                    }
+                    let (request_input, request_memory) = crate::memory::measure(false, || {
+                        object
+                            .get("input")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .unwrap_or_default()
+                    });
                     let body = match serde_json::to_vec(&frame) {
                         Ok(body) => bytes::Bytes::from(body),
                         Err(error) => {
@@ -2542,6 +2594,15 @@ impl App {
                             continue;
                         }
                     };
+                    // The serialized HTTP body owns its bytes. Reuse the parsed
+                    // frame for retry analysis rather than retaining another tree.
+                    let mut retry_frame = frame;
+                    retry_frame["type"] = serde_json::Value::String("response.create".into());
+                    if let Some(anchor) = &routing_previous_response_id {
+                        retry_frame["previous_response_id"] =
+                            serde_json::Value::String(anchor.clone());
+                    }
+                    let request_input = HttpBridgeInput::measured(request_input, request_memory);
                     let app = self.clone();
                     let listener = listener.clone();
                     let path = path.clone();
@@ -2549,9 +2610,11 @@ impl App {
                     let outbound = turn_outbound;
                     let fatal = fatal_tx.clone();
                     let continuation = continuation.clone();
+                    let body_memory = crate::memory::Reservation::turn_bytes(body.len());
                     let turn_guard = turn_guard.take().expect("response.create turn guard");
                     active_turn = self
                         .spawn_tracked_task(async move {
+                            let _memory = body_memory;
                             let _turn_guard = turn_guard;
                             app.run_http_bridge_turn(
                                 headers,
@@ -2560,7 +2623,10 @@ impl App {
                                 body,
                                 routing_previous_response_id,
                                 request_input,
-                                retry_frame,
+                                HttpBridgeRetryFrame {
+                                    value: retry_frame,
+                                    _memory: frame_memory,
+                                },
                                 &outbound,
                                 &continuation,
                                 &fatal,
@@ -2605,8 +2671,8 @@ impl App {
         path: String,
         body: bytes::Bytes,
         mut routing_previous_response_id: Option<String>,
-        request_input: Vec<serde_json::Value>,
-        retry_frame: serde_json::Value,
+        request_input: HttpBridgeInput,
+        retry_frame: HttpBridgeRetryFrame,
         outbound: &BridgeSender,
         continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
         fatal: &mpsc::UnboundedSender<String>,
@@ -2616,7 +2682,7 @@ impl App {
         let mut dispatch_deadline = tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT;
         let retry_view = match tokio::time::timeout_at(
             dispatch_deadline,
-            self.context_routing_view(&retry_frame, listener, &headers),
+            self.context_routing_view(&retry_frame.value, listener, &headers),
         )
         .await
         {
@@ -2641,6 +2707,8 @@ impl App {
                     && (analysis.previous_response_id.is_none()
                         || analysis.full_resend == websocket_protocol::FullResendSafety::Eligible)
             });
+        drop(retry_view);
+        drop(retry_frame);
         let dispatch = Arc::new(StdMutex::new(BridgeDispatchState {
             cross_account_safe: bridge_replayable,
             ..BridgeDispatchState::default()
@@ -5950,7 +6018,7 @@ async fn pump_http_response_to_websocket(
     response: Response<ProxyBody>,
     outbound: &BridgeSender,
     app: &Arc<App>,
-    request_input: Vec<serde_json::Value>,
+    request_input: HttpBridgeInput,
     continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
     response_created_deadline: tokio::time::Instant,
     upstream_idle_timeout: Duration,
@@ -5970,6 +6038,7 @@ async fn pump_http_response_to_websocket(
         input: request_input,
         response_id: None,
         output: Vec::new(),
+        output_memory: Vec::new(),
         delivered_event: false,
         response_created: false,
         progress_events: 0,
@@ -6384,10 +6453,16 @@ async fn deliver_bridge_event(
         && permits_affinity
         && let Some(response_id) = capture.response_id.clone()
     {
+        capture.input.retain();
+        let output_memory = std::mem::take(&mut capture.output_memory);
+        for memory in &output_memory {
+            memory.retain_as_continuation();
+        }
         *continuation.lock().expect("bridge continuation") = Some(HttpBridgeContinuation {
             response_id,
             input: capture.input.clone(),
-            output: capture.output.clone(),
+            output: std::mem::take(&mut capture.output),
+            _output_memory: output_memory,
         });
     }
     if !outbound.send(Message::Text(payload.into())).await {
@@ -7661,7 +7736,7 @@ mod tests {
             response,
             &outbound,
             app,
-            Vec::new(),
+            Vec::new().into(),
             &continuation,
             tokio::time::Instant::now() + created_after,
             idle_for,
@@ -11180,8 +11255,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
     #[test]
     fn http_bridge_continuation_rejects_partial_history_overlap() {
         let cached = HttpBridgeContinuation {
+            _output_memory: Vec::new(),
             response_id: "resp_anchor".into(),
-            input: vec![serde_json::json!({"role":"user","content":"first"})],
+            input: vec![serde_json::json!({"role":"user","content":"first"})].into(),
             output: vec![serde_json::json!({"role":"assistant","content":"answer"})],
         };
         let error = materialize_http_bridge_continuation(
@@ -11195,14 +11271,38 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         assert!(error.contains("partially overlaps"));
     }
 
+    #[cfg(feature = "memory-diagnostics")]
+    #[test]
+    fn http_bridge_shared_input_does_not_copy_json_or_mutate_cached_history() {
+        let first = serde_json::json!({"role":"user","content":"x".repeat(64 * 1024)});
+        let input: HttpBridgeInput = vec![first.clone()].into();
+        let (shared, allocation) = crate::memory::measure(false, || input.clone());
+        // Measured by the allocator, not by the shape of the implementation.
+        assert_eq!(allocation.bytes_for_test(), 0);
+        let cached = HttpBridgeContinuation {
+            response_id: "resp_anchor".into(),
+            input: shared,
+            output: vec![serde_json::json!({"role":"assistant","content":"answer"})],
+            _output_memory: Vec::new(),
+        };
+        let incoming = serde_json::json!({"role":"user","content":"next"});
+        let materialized =
+            materialize_http_bridge_continuation(cached, vec![incoming.clone()]).unwrap();
+        assert_eq!(materialized.len(), 3);
+        assert_eq!(materialized[0], first);
+        assert_eq!(materialized[2], incoming);
+        assert_eq!(input.0.values, vec![first]);
+    }
+
     #[test]
     fn http_bridge_continuation_materializes_pure_delta() {
         let first = serde_json::json!({"role":"user","content":"first"});
         let answer = serde_json::json!({"role":"assistant","content":"answer"});
         let second = serde_json::json!({"role":"user","content":"second"});
         let cached = HttpBridgeContinuation {
+            _output_memory: Vec::new(),
             response_id: "resp_anchor".into(),
-            input: vec![first.clone()],
+            input: vec![first.clone()].into(),
             output: vec![answer.clone()],
         };
         assert_eq!(
@@ -11216,8 +11316,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         let first = serde_json::json!({"role":"user","content":"first"});
         let answer = serde_json::json!({"role":"assistant","content":"answer"});
         let cached = HttpBridgeContinuation {
+            _output_memory: Vec::new(),
             response_id: "resp_anchor".into(),
-            input: vec![first.clone()],
+            input: vec![first.clone()].into(),
             output: vec![answer.clone()],
         };
         assert_eq!(
@@ -11232,8 +11333,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         let first = serde_json::json!({"role":"user","content":"first"});
         let answer = serde_json::json!({"role":"assistant","content":"answer"});
         let cached = HttpBridgeContinuation {
+            _output_memory: Vec::new(),
             response_id: "resp_anchor".into(),
-            input: vec![first],
+            input: vec![first].into(),
             output: vec![answer.clone()],
         };
         let error = materialize_http_bridge_continuation(
@@ -11282,8 +11384,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
     fn http_bridge_continuation_empty_cache_preserves_input() {
         let incoming = vec![serde_json::json!({"role":"user","content":"first"})];
         let cached = HttpBridgeContinuation {
+            _output_memory: Vec::new(),
             response_id: "resp_anchor".into(),
-            input: Vec::new(),
+            input: Vec::new().into(),
             output: Vec::new(),
         };
         assert_eq!(
@@ -11296,8 +11399,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
     fn http_bridge_continuation_defers_byte_limit_to_configured_request_limit() {
         let large = "x".repeat(RESPONSES_JSON_RESPONSE_LIMIT + 1);
         let cached = HttpBridgeContinuation {
+            _output_memory: Vec::new(),
             response_id: "resp_anchor".into(),
-            input: Vec::new(),
+            input: Vec::new().into(),
             output: Vec::new(),
         };
         let input = materialize_http_bridge_continuation(
@@ -11321,8 +11425,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
     #[test]
     fn http_bridge_continuation_bounds_full_history_resends() {
         let cached = HttpBridgeContinuation {
+            _output_memory: Vec::new(),
             response_id: "resp_anchor".into(),
-            input: vec![serde_json::json!({"role":"user","content":"first"})],
+            input: vec![serde_json::json!({"role":"user","content":"first"})].into(),
             output: Vec::new(),
         };
         let mut incoming = vec![serde_json::json!({"role":"user","content":"first"})];

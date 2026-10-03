@@ -26,6 +26,10 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-linux-ar
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-linux-x86_64.tar.gz"
 
+[features]
+default = []
+memory-diagnostics = []
+
 [dependencies]
 anyhow = "1"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }

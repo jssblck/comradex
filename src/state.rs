@@ -34,6 +34,8 @@ pub struct Stats {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::memory::MemorySnapshot>,
     pub inflight_http: usize,
     #[serde(default)]
     pub inflight_bridge_turns: usize,
@@ -76,6 +78,7 @@ impl Stats {
         let records = router.record_count().await;
         let routing = router.routing_snapshot().await;
         StatsSnapshot {
+            memory: crate::memory::snapshot(),
             inflight_http: self.inflight_http.load(Ordering::Relaxed),
             inflight_bridge_turns: self.inflight_bridge_turns.load(Ordering::Relaxed),
             open_upgrades: self.open_upgrades.load(Ordering::Relaxed),

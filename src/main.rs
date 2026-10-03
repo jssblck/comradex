@@ -698,6 +698,17 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
     println!("\ntraffic");
     match snapshot {
         Some(stats) => {
+            if let Some(memory) = &stats.memory {
+                println!(
+                    "  Rust allocations: {} live, {} peak; bridge history: {} live, {} peak; turn copies: {} live, {} peak",
+                    human_bytes(memory.rust_live_bytes),
+                    human_bytes(memory.rust_peak_bytes),
+                    human_bytes(memory.bridge_continuation_bytes),
+                    human_bytes(memory.bridge_continuation_peak_bytes),
+                    human_bytes(memory.bridge_turn_copy_bytes),
+                    human_bytes(memory.bridge_turn_copy_peak_bytes),
+                );
+            }
             println!(
                 "  {} HTTP request(s) and {} bridge turn(s) in flight, {} open connection(s)",
                 stats.inflight_http, stats.inflight_bridge_turns, stats.open_upgrades

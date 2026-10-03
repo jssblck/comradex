@@ -5,6 +5,7 @@ pub mod codex_process;
 pub mod config;
 pub mod control;
 pub mod install;
+pub mod memory;
 pub mod proxy;
 pub mod reset_credits;
 pub mod routing;
