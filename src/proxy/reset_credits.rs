@@ -1,4 +1,190 @@
 use super::*;
+use crate::config::AccountConfig;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+pub(super) const CODEX_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+
+#[derive(Default)]
+pub(super) struct ResetCredits {
+    pub claude: AsyncMutex<HashMap<String, ClaudeCredits>>,
+}
+
+pub(super) struct ClaudeCredits {
+    pub owner: auth::QuotaOwner,
+    pub value: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConsumeCredit {
+    credit_id: String,
+    redeem_request_id: String,
+}
+
+impl ConsumeCredit {
+    pub fn parse(data: Option<&str>) -> Option<Self> {
+        let value: Self = serde_json::from_str(data?).ok()?;
+        if value.credit_id.is_empty()
+            || !value
+                .credit_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !crate::claude::wire::uuid(&value.redeem_request_id)
+        {
+            return None;
+        }
+        Some(value)
+    }
+}
+
+impl App {
+    pub(super) async fn codex_reset_credits(
+        &self,
+        account_id: &str,
+        consume: Option<ConsumeCredit>,
+    ) -> Response<ProxyBody> {
+        // Redemption bounds each of its own steps. An outer deadline could report a
+        // confirmed reset as failed while its follow-up usage refresh is still running.
+        let operation = match consume {
+            Some(credit) => self.consume_codex_reset_credit(account_id, credit).await,
+            None => tokio::time::timeout(
+                USAGE_FETCH_ACCOUNT_TIMEOUT,
+                self.list_codex_reset_credits(account_id),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("reset-credit listing timed out"))),
+        };
+        match operation {
+            Ok((status, body)) => super::usage_management::api_response(status, body),
+            Err(_) => super::usage_management::api_response(
+                StatusCode::BAD_GATEWAY,
+                json!({ "error": "reset-credit request could not be completed" }),
+            ),
+        }
+    }
+
+    async fn consume_codex_reset_credit(
+        &self,
+        account_id: &str,
+        credit: ConsumeCredit,
+    ) -> Result<(StatusCode, Value)> {
+        match self
+            .use_reset_credit(account_id, &credit.credit_id, &credit.redeem_request_id)
+            .await
+        {
+            Ok(result) => Ok((StatusCode::OK, serde_json::to_value(result)?)),
+            Err(error) => match error.downcast_ref::<ResetProviderError>() {
+                Some(provider) => Ok((
+                    provider.0,
+                    json!({ "error": "provider rejected reset-credit request" }),
+                )),
+                None => Err(error),
+            },
+        }
+    }
+
+    async fn list_codex_reset_credits(&self, account_id: &str) -> Result<(StatusCode, Value)> {
+        let account = &self.config.accounts[account_id];
+        anyhow::ensure!(matches!(account, AccountConfig::CodexHome { .. }));
+        let url = self.reset_credits_url(false)?;
+        let mut credentials = self.auth.resolve(account, &hyper::HeaderMap::new()).await?;
+        let mut response = self
+            .fetch_account_endpoint(&credentials, Method::GET, url.clone(), empty_body())
+            .await?;
+        // A rejected read may refresh once. A redemption is never replayed automatically.
+        if response.0 == StatusCode::UNAUTHORIZED {
+            credentials = self
+                .auth
+                .force_refresh(account, &credentials)
+                .await?
+                .context("credentials cannot refresh")?;
+            response = self
+                .fetch_account_endpoint(&credentials, Method::GET, url, empty_body())
+                .await?;
+        }
+        let (status, bytes) = response;
+        if !status.is_success() {
+            return Ok((
+                status,
+                json!({ "error": "provider rejected reset-credit request" }),
+            ));
+        }
+        let body: Value = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(body["credits"].is_array(), "missing reset credits");
+        Ok((status, body))
+    }
+
+    pub(super) async fn acknowledge_credit_reset(&self, account: &str) -> Response<ProxyBody> {
+        if !matches!(
+            self.config.accounts.get(account),
+            Some(AccountConfig::CodexHome { .. })
+        ) {
+            return error_response(StatusCode::NOT_FOUND, "not_found", "unknown Codex account");
+        }
+        let _ = tokio::time::timeout(
+            USAGE_FETCH_TIMEOUT,
+            self.fetch_managed_usage_account(
+                account,
+                &self.config.accounts[account],
+                chrono::Utc::now().timestamp().max(0) as u64,
+            ),
+        )
+        .await;
+        // Redemption clears its own cooldown. This compatibility call cannot clear
+        // a block on its own, including a newer rejection after the reset completed.
+        let snapshot = self.router.routing_snapshot().await;
+        if snapshot
+            .account_states
+            .get(account)
+            .is_some_and(|state| state.unavailable_reason.as_deref() == Some("quota"))
+        {
+            return error_response(
+                StatusCode::CONFLICT,
+                "quota_still_active",
+                "account still has an active quota cooldown",
+            );
+        }
+        super::usage_management::management_json(json!({ "status": "ok" }))
+    }
+
+    pub(super) async fn observe_claude_reset_credits(
+        &self,
+        account: &str,
+        owner: auth::QuotaOwner,
+        bytes: &[u8],
+    ) {
+        let value = serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .and_then(|mut body| body.as_object_mut()?.remove("cedar_ember"));
+        let mut observations = self.reset_credits.claude.lock().await;
+        if let Some(value) = value {
+            observations.insert(account.into(), ClaudeCredits { owner, value });
+        } else {
+            observations.remove(account);
+        }
+    }
+
+    pub(super) async fn claude_reset_credits(&self, account: &str) -> Option<Value> {
+        let AccountConfig::ClaudeHome { path } = &self.config.accounts[account] else {
+            return None;
+        };
+        let path = path.clone();
+        let current = tokio::task::spawn_blocking(move || crate::claude::auth::read(&path))
+            .await
+            .ok()?
+            .ok()?;
+        self.reset_credits
+            .claude
+            .lock()
+            .await
+            .get(account)
+            .filter(|observation| observation.owner == current.owner())
+            .map(|observation| observation.value.clone())
+    }
+}
+
 use crate::reset_credits::{ResetCreditsResponse, ResetCreditsSnapshot, ResetOutcome, ResetResult};
 
 /// Held under the account's usage lock. An uncertain POST may only be retried
@@ -214,9 +400,7 @@ impl App {
             "reset outcome unknown; refresh credits before retrying with the same request ID",
         )??;
         if !status.is_success() {
-            bail!(
-                "reset endpoint returned HTTP {status}; refresh credits before retrying with the same request ID"
-            );
+            return Err(ResetProviderError(status).into());
         }
         let mut result: ResetResult = serde_json::from_slice(&bytes).context(
             "reset outcome unknown; refresh credits before retrying with the same request ID",
@@ -253,3 +437,18 @@ impl App {
         Ok(result)
     }
 }
+
+#[derive(Debug)]
+struct ResetProviderError(StatusCode);
+
+impl std::fmt::Display for ResetProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reset endpoint returned HTTP {}; refresh credits before retrying with the same request ID",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ResetProviderError {}

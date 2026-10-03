@@ -27,6 +27,9 @@ mod reset_credits;
 #[allow(dead_code)]
 mod sse;
 mod usage_activation;
+mod usage_management;
+#[cfg(test)]
+mod usage_management_tests;
 #[allow(dead_code)]
 mod websocket_protocol;
 
@@ -850,6 +853,7 @@ pub struct App {
     live_calls: LiveCallStore,
     auth: auth::Resolver,
     usage_url: Uri,
+    reset_credits: reset_credits::ResetCredits,
     usage_locks: HashMap<String, AsyncMutex<Option<reset_credits::ResetAttempt>>>,
     usage_activation: AsyncMutex<Result<crate::usage_activation::UsageActivationLedger>>,
     file_owners: Arc<AffinityStore>,
@@ -892,6 +896,7 @@ impl App {
         auth.health = router.auth_health.clone();
         Ok(Arc::new(Self {
             claude: claude::Claude::new(&config)?,
+            reset_credits: reset_credits::ResetCredits::default(),
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             bridge_turn_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             upgrade_slots: Arc::new(Semaphore::new(config.proxy.max_upgrades)),
@@ -1285,6 +1290,8 @@ impl App {
     ) -> Result<Response<ProxyBody>, Infallible> {
         let response = if self.service_health_path(req.uri()) {
             self.health_response()
+        } else if Self::usage_management_path(req.uri()) {
+            self.handle_usage_management(req, &listener).await
         } else if self.config.is_claude_pool(&listener.pool) {
             self.handle_claude(req, &listener)
                 .await
