@@ -88,11 +88,12 @@ enum AccountCommand {
     /// pool, log it in, and restart the daemon
     Add {
         name: String,
-        /// Add a Claude subscription account (use --pool claude)
+        /// Add a Claude subscription account
         #[arg(long)]
         claude: bool,
-        #[arg(long, default_value = "default")]
-        pool: String,
+        /// Pool to join [default: "claude" with --claude, otherwise "default"]
+        #[arg(long)]
+        pool: Option<String>,
         /// Skip the interactive sign-in (run `comradex account login <name>` later)
         #[arg(long)]
         no_login: bool,
@@ -1007,6 +1008,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             claude,
         } => {
             load_config(config_path)?;
+            let pool = pool.unwrap_or_else(|| if claude { "claude" } else { "default" }.into());
             let text = fs::read_to_string(config_path)
                 .with_context(|| format!("read {}", config_path.display()))?;
             let updated = if claude {

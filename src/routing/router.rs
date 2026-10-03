@@ -1192,7 +1192,7 @@ impl Router {
         }
     }
 
-    /// Replace the last observed usage view with an authoritative WHAM snapshot.
+    /// Update the usage view from a management poll or native response headers.
     /// Exhausted windows block dispatch independently of rejection-derived cooldowns.
     pub async fn observe_usage_snapshot_for_owner(
         &self,
@@ -1329,11 +1329,11 @@ fn reconcile_runtime(runtime: &mut AccountRuntime, now: Instant, wall_now: DateT
 }
 
 fn expire_claude_usage(runtime: &mut AccountRuntime, now: i64) {
+    // A reset makes the old observation unknown, not proof of zero usage.
     for key in ["5h", "7d"] {
         if let Some(window) = runtime.usage_windows.get_mut(key)
             && window.reset_at_unix.is_some_and(|reset| reset <= now)
         {
-            // A reset makes the old observation unknown, not proof of zero usage.
             window.used_percent = None;
         }
     }

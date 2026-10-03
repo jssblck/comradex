@@ -267,8 +267,12 @@ impl BoundedLoginOutput {
             (token == "https://auth.openai.com/codex/device"
                 || token.parse::<hyper::Uri>().is_ok_and(|uri| {
                     uri.scheme_str() == Some("https")
-                        && uri.authority().is_some_and(|a| a.as_str() == "claude.ai")
-                        && uri.path() == "/oauth/authorize"
+                        && matches!(
+                            (uri.authority().map(|a| a.as_str()), uri.path()),
+                            // Older Claude Code releases use claude.ai; newer ones claude.com.
+                            (Some("claude.ai"), "/oauth/authorize")
+                                | (Some("claude.com"), "/cai/oauth/authorize")
+                        )
                         && uri.query().is_some()
                 }))
             .then(|| token.to_owned())
@@ -391,7 +395,8 @@ impl LoginManager {
                 {
                     return Ok(false);
                 }
-                // Check the provider's durable file credentials while login owns the home lock.
+                // A successful child exit can still leave credentials in Keychain or
+                // no usable file at all. Check while login still owns the home lock.
                 Ok(if claude {
                     crate::claude::auth::read(&home).is_ok()
                 } else {
@@ -1793,8 +1798,9 @@ kind = "inbound"
                             fs::write(
                                 home.join("claude-auth.json"),
                                 serde_json::to_vec(&serde_json::json!({
-                                    "access_token": "sk-ant-oat-test-secret", "refresh_token": "test-refresh",
-                                    "expires_at": 4102444800_u64,
+                                    "access_token": "sk-ant-oat01-synthetic",
+                                    "refresh_token": "synthetic",
+                                    "expires_at": crate::claude::auth::now() + 3600,
                                     "account_uuid": "11111111-1111-4111-8111-111111111111",
                                     "organization_uuid": "22222222-2222-4222-8222-222222222222",
                                     "device_id": "a".repeat(64)
@@ -1810,7 +1816,14 @@ kind = "inbound"
                     }
                     FakeLoginOutcome::SuccessWithoutCredentials => Ok(true),
                     FakeLoginOutcome::SuccessWithMalformedCredentials => {
-                        fs::write(home.join("auth.json"), "private malformed credentials")?;
+                        fs::write(
+                            home.join(if claude {
+                                "claude-auth.json"
+                            } else {
+                                "auth.json"
+                            }),
+                            "private malformed credentials",
+                        )?;
                         Ok(true)
                     }
                     FakeLoginOutcome::ExitFailure => Ok(false),
@@ -2140,47 +2153,70 @@ path = "accounts/work"
 
     #[tokio::test]
     async fn managed_login_failure_is_stable_and_restores_routing_availability() {
-        for (outcome, expected_error) in [
-            (
-                FakeLoginOutcome::SuccessWithoutCredentials,
-                "codex_login_failed",
-            ),
-            (
-                FakeLoginOutcome::SuccessWithMalformedCredentials,
-                "codex_login_failed",
-            ),
-            (FakeLoginOutcome::ExitFailure, "codex_login_failed"),
-            (FakeLoginOutcome::RunnerError, "codex_login_unavailable"),
-        ] {
-            let (_dir, config, router) = managed_login_fixture();
-            let started = Arc::new(Notify::new());
-            let finish = Arc::new(Notify::new());
-            let manager = LoginManager::new(
-                Arc::new(FakeLoginRunner {
-                    started: started.clone(),
-                    finish: finish.clone(),
-                    output: b"internal detail that must not escape".to_vec(),
-                    outcome,
-                }),
-                router.clone(),
-            );
-            let home = managed_account_home(&config, "work").unwrap().to_owned();
-            let session = manager.start("work".to_owned(), home, false).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(1), started.notified())
-                .await
-                .unwrap();
-            finish.notify_one();
-            let completed = wait_for_login(&manager, &session.session_id).await;
-            assert_eq!(completed.state, UiLoginState::Failed);
-            assert_eq!(completed.error.as_deref(), Some(expected_error));
-            assert!(completed.verification_uri.is_none());
-            assert!(completed.user_code.is_none());
-            assert!(
-                router
-                    .select_exact(&config.pools["default"], "work")
+        for claude in [false, true] {
+            for (outcome, expected_error) in [
+                (
+                    FakeLoginOutcome::SuccessWithoutCredentials,
+                    "codex_login_failed",
+                ),
+                (
+                    FakeLoginOutcome::SuccessWithMalformedCredentials,
+                    "codex_login_failed",
+                ),
+                (FakeLoginOutcome::ExitFailure, "codex_login_failed"),
+                (FakeLoginOutcome::RunnerError, "codex_login_unavailable"),
+            ] {
+                let (_dir, mut config, mut router) = managed_login_fixture();
+                if claude {
+                    let home = managed_account_home(&config, "work").unwrap().to_owned();
+                    Arc::make_mut(&mut config).accounts.insert(
+                        "work".into(),
+                        crate::config::AccountConfig::ClaudeHome { path: home },
+                    );
+                    router = Arc::new(Router::new(&config, router.affinity.clone()));
+                }
+                let started = Arc::new(Notify::new());
+                let finish = Arc::new(Notify::new());
+                let manager = LoginManager::new(
+                    Arc::new(FakeLoginRunner {
+                        started: started.clone(),
+                        finish: finish.clone(),
+                        output: b"internal detail that must not escape".to_vec(),
+                        outcome,
+                    }),
+                    router.clone(),
+                );
+                let home = managed_account_home(&config, "work").unwrap().to_owned();
+                let session = manager
+                    .start("work".to_owned(), home, claude)
                     .await
-                    .is_some()
-            );
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(1), started.notified())
+                    .await
+                    .unwrap();
+                finish.notify_one();
+                let completed = wait_for_login(&manager, &session.session_id).await;
+                assert_eq!(completed.state, UiLoginState::Failed);
+                assert_eq!(
+                    completed.error.as_deref(),
+                    Some(
+                        if claude {
+                            expected_error.replace("codex", "claude")
+                        } else {
+                            expected_error.to_owned()
+                        }
+                        .as_str()
+                    )
+                );
+                assert!(completed.verification_uri.is_none());
+                assert!(completed.user_code.is_none());
+                assert!(
+                    router
+                        .select_exact(&config.pools["default"], "work")
+                        .await
+                        .is_some()
+                );
+            }
         }
     }
 
@@ -2231,6 +2267,29 @@ path = "accounts/work"
             let mut output = BoundedLoginOutput::default();
             output.append(format!("\x1b[1;94m{url}\x1b[0m\n").as_bytes());
             assert_eq!(output.allowed_fields(), (None, None));
+        }
+    }
+
+    #[test]
+    fn bounded_login_output_accepts_only_claude_authorization_urls() {
+        for url in [
+            "https://claude.ai/oauth/authorize?state=synthetic",
+            "https://claude.com/cai/oauth/authorize?state=synthetic",
+        ] {
+            let mut output = BoundedLoginOutput::default();
+            output.append(format!("Open {url}\n").as_bytes());
+            assert_eq!(output.allowed_fields().0.as_deref(), Some(url));
+        }
+        for url in [
+            "https://claude.com/oauth/authorize?state=synthetic",
+            "https://claude.ai/cai/oauth/authorize?state=synthetic",
+            "https://claude.com.evil.example/cai/oauth/authorize?state=synthetic",
+            "https://claude.com/cai/oauth/authorize",
+            "http://claude.com/cai/oauth/authorize?state=synthetic",
+        ] {
+            let mut output = BoundedLoginOutput::default();
+            output.append(format!("Open {url}\n").as_bytes());
+            assert_eq!(output.allowed_fields().0, None, "{url}");
         }
     }
 
