@@ -143,6 +143,8 @@ struct AccountRuntime {
     quota_until: Option<Instant>,
     quota_reset_at: Option<DateTime<Utc>>,
     quota_evidence: Option<QuotaEvidence>,
+    /// When the current Claude limit was recorded, so an older usage poll cannot clear it.
+    claude_quota_at: Option<i64>,
     avoid_until: Option<Instant>,
     capacity: CapacityBackoff,
 }
@@ -214,6 +216,7 @@ type QuotaEvidence = HashMap<QuotaWindow, WindowEvidence>;
 pub struct Router {
     pub auth_health: ManagedAuthHealth,
     managed_homes: HashMap<String, std::path::PathBuf>,
+    claude_homes: HashMap<String, std::path::PathBuf>,
     pub affinity: Arc<AffinityStore>,
     accounts: Mutex<HashMap<String, AccountRuntime>>,
     preferred: Mutex<HashMap<String, String>>,
@@ -257,6 +260,7 @@ impl Router {
         let mut accounts = self.accounts.lock().await;
         let now = Utc::now().timestamp().max(0) as u64;
         for (name, runtime) in accounts.iter_mut() {
+            expire_claude_usage(runtime, now as i64);
             if runtime
                 .quota_owner
                 .as_ref()
@@ -280,6 +284,12 @@ impl Router {
     }
 
     fn reconcile_quota_owner(&self, account: &str, runtime: &mut AccountRuntime) {
+        if let Some(home) = self.claude_homes.get(account) {
+            if let Ok(current) = crate::claude::auth::read(home) {
+                Self::reconcile_quota_owner_snapshot(runtime, &current.owner());
+            }
+            return;
+        }
         let Some(home) = self.managed_homes.get(account) else {
             return;
         };
@@ -315,6 +325,15 @@ impl Router {
         runtime: &mut AccountRuntime,
         owner: &QuotaOwner,
     ) -> bool {
+        if let Some(home) = self.claude_homes.get(account) {
+            let Ok(current) = crate::claude::auth::read(home) else {
+                return false;
+            };
+            if current.owner() != *owner {
+                return false;
+            }
+            Self::reconcile_quota_owner_snapshot(runtime, owner);
+        }
         if let Some(home) = self.managed_homes.get(account) {
             let Ok(current) = managed_quota_owner(home) else {
                 return false;
@@ -333,6 +352,14 @@ impl Router {
     pub fn new(config: &Config, affinity: Arc<AffinityStore>) -> Self {
         Self {
             auth_health: ManagedAuthHealth::default(),
+            claude_homes: config
+                .accounts
+                .iter()
+                .filter_map(|(name, account)| match account {
+                    AccountConfig::ClaudeHome { path } => Some((name.clone(), path.clone())),
+                    _ => None,
+                })
+                .collect(),
             managed_homes: config
                 .accounts
                 .iter()
@@ -985,6 +1012,57 @@ impl Router {
             a.avoid_until = Some(Instant::now() + Duration::from_secs(5));
         }
     }
+
+    pub(crate) async fn claude_quota_until(&self, account: &str, reset: u64, owner: &QuotaOwner) {
+        if let Some(runtime) = self.accounts.lock().await.get_mut(account) {
+            if !self.accepts_quota_owner(account, runtime, owner) {
+                return;
+            }
+            let now = crate::claude::auth::now();
+            let Some(at) = chrono::DateTime::from_timestamp(reset.min(i64::MAX as u64) as i64, 0)
+            else {
+                return;
+            };
+            let Some(deadline) =
+                Instant::now().checked_add(Duration::from_secs(reset.saturating_sub(now)))
+            else {
+                return;
+            };
+            runtime.quota_until = Some(deadline);
+            runtime.quota_reset_at = Some(at);
+            runtime.claude_quota_at = Some(now as i64);
+        }
+    }
+
+    pub(crate) async fn observe_claude_usage_for_owner(
+        &self,
+        account: &str,
+        snapshot: UsageSnapshot,
+        owner: &QuotaOwner,
+    ) {
+        let now = crate::claude::auth::now();
+        let reset = snapshot
+            .windows
+            .values()
+            .filter(|w| w.used_percent == Some(100))
+            .filter_map(|w| w.reset_at_unix)
+            .filter(|at| *at > now as i64)
+            .max();
+        let observed_at = snapshot.observed_at_unix;
+        self.observe_usage_snapshot_for_owner(account, snapshot, owner)
+            .await;
+        if let Some(reset) = reset {
+            self.claude_quota_until(account, reset as u64, owner).await;
+        } else if let Some(runtime) = self.accounts.lock().await.get_mut(account)
+            && self.accepts_quota_owner(account, runtime, owner)
+            && runtime.claude_quota_at.is_none_or(|at| observed_at > at)
+        {
+            runtime.quota_until = None;
+            runtime.quota_reset_at = None;
+            runtime.quota_evidence = None;
+            runtime.claude_quota_at = None;
+        }
+    }
     pub async fn capacity_failure(&self, account: &str) {
         if let Some(runtime) = self.accounts.lock().await.get_mut(account)
             && let Some(delay) = runtime.capacity.record(Instant::now())
@@ -1114,18 +1192,30 @@ impl Router {
         }
     }
 
-    /// Replace the last observed usage view with an authoritative WHAM snapshot.
+    /// Update the usage view from a management poll or native response headers.
     /// Exhausted windows block dispatch independently of rejection-derived cooldowns.
     pub async fn observe_usage_snapshot_for_owner(
         &self,
         account: &str,
-        snapshot: UsageSnapshot,
+        mut snapshot: UsageSnapshot,
         owner: &QuotaOwner,
     ) {
         let observed_evidence = usage_snapshot_evidence(&snapshot);
         if let Some(runtime) = self.accounts.lock().await.get_mut(account) {
             if !self.accepts_quota_owner(account, runtime, owner) {
                 return;
+            }
+            // Claude inference can report only one shared window. Its management poll
+            // reports both; a partial inference update must not erase the other one.
+            if snapshot.windows.contains_key("5h") || snapshot.windows.contains_key("7d") {
+                for name in ["5h", "7d"] {
+                    if let Some(window) = runtime.usage_windows.get(name) {
+                        snapshot
+                            .windows
+                            .entry(name.into())
+                            .or_insert_with(|| window.clone());
+                    }
+                }
             }
             runtime.legacy_usage = None;
             runtime.usage_updated_at_unix = Some(snapshot.observed_at_unix);
@@ -1236,6 +1326,17 @@ fn reconcile_runtime(runtime: &mut AccountRuntime, now: Instant, wall_now: DateT
         runtime.needs_login_retry_at = None;
     }
     reconcile_expired_quota(runtime, now, wall_now);
+}
+
+fn expire_claude_usage(runtime: &mut AccountRuntime, now: i64) {
+    // A reset makes the old observation unknown, not proof of zero usage.
+    for key in ["5h", "7d"] {
+        if let Some(window) = runtime.usage_windows.get_mut(key)
+            && window.reset_at_unix.is_some_and(|reset| reset <= now)
+        {
+            window.used_percent = None;
+        }
+    }
 }
 
 fn account_routing_status(
@@ -1529,6 +1630,32 @@ fn seconds_until(reset_at: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_reset_expires_only_the_finished_window_without_claiming_zero_usage() {
+        let mut runtime = super::AccountRuntime::default();
+        for (name, percent, reset) in [("5h", 100, 100), ("7d", 60, 200)] {
+            runtime.usage_windows.insert(
+                name.into(),
+                super::QuotaWindowStatus {
+                    used_percent: Some(percent),
+                    reset_at_unix: Some(reset),
+                    limit_window_seconds: None,
+                },
+            );
+        }
+        super::expire_claude_usage(&mut runtime, 100);
+        assert_eq!(
+            runtime.usage_at(DateTime::from_timestamp(100, 0).unwrap()),
+            Some(60)
+        );
+        assert_eq!(runtime.usage_windows["5h"].used_percent, None);
+        super::expire_claude_usage(&mut runtime, 200);
+        assert_eq!(
+            runtime.usage_at(DateTime::from_timestamp(200, 0).unwrap()),
+            None
+        );
+    }
+
     use super::*;
     use crate::config::{AccountConfig, ListenerConfig, ProxyConfig};
     use hyper::{HeaderMap, header::HeaderValue};

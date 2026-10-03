@@ -2,7 +2,7 @@
 
 > Workers of all accounts, unite.
 
-Comradex is a small Rust relay that gives the native Codex App/CLI a sticky, quota-aware collective of ChatGPT accounts.
+Comradex is a small Rust relay that gives native Codex and Claude Code sticky, quota-aware account pools.
 
 ## Quick start
 
@@ -39,6 +39,42 @@ comradex account add personal_2
 ```
 
 The command updates the configuration, restarts the daemon if it is installed as a service, and walks through device login. See [Accounts](#accounts) for the manual setup and credential details.
+
+## Claude Code
+
+Claude Code accounts use a separate pool and loopback listener. Add accounts through the official Claude Code login:
+
+```sh
+comradex account add grace --claude
+comradex account add ada --claude
+comradex install --listener claude
+```
+
+`--claude` uses the `claude` pool unless `--pool` names another. The first add creates the pool and its listener at `127.0.0.1:10101`; change the address in `comradex.toml` if needed. A running macOS service reloads after accounts are added; restart a manually launched daemon yourself. Restart Claude Code after installation.
+
+Installation sets only `env.ANTHROPIC_BASE_URL` in Claude Code's `settings.json`, using the listener's secret URL. Use `--claude-settings <path>` for another settings file. Keep Claude Code's ordinary subscription login; do not configure a placeholder API key or auth token. `comradex uninstall` restores both Claude and Codex gateway settings without touching unrelated settings, and refuses to overwrite a gateway URL changed after installation.
+
+Each managed Claude account signs in through an isolated native login profile. Comradex imports the OAuth grant and the account's real account and device identity into a private credential file, then owns every later refresh, including background renewal before expiry. Do not run Claude Code in the `accounts/<name>/native-login` directories; that would create a second refresh owner. Reauthenticate with **Sign In…** in the menubar or `comradex account login <name>`. Set `CLAUDE_EXECUTABLE` to an absolute path if Claude Code is installed somewhere unusual. `account connect` applies only to existing Codex logins.
+
+On several computers, sign each account in separately on each machine. Do not copy `claude-auth.json` between running daemons: independent refreshes of the same rotating grant invalidate each other.
+
+New sessions follow the same prefer/preserve roles as Codex pools:
+
+```sh
+comradex account prefer grace --pool claude
+comradex account preserve ada --pool claude
+```
+
+To warm Claude's 5-hour and 7-day windows after they reset, opt in separately from Codex's weekly warming:
+
+```toml
+[proxy]
+auto_activate_claude_usage = true
+```
+
+The usage worker checks every five minutes; the menubar's Refresh requests an earlier check. An elapsed or newly full window is warmed by running the installed Claude Code once with a tiny Haiku prompt, no tools, and a temporary profile holding that account's access token but not its refresh grant. Warming stays on the selected account and skips active limits, concurrent traffic on the account, and windows already started by normal use. Attempts survive daemon restarts, and uncertain attempts wait an hour before retrying. Warming consumes a small amount of subscription quota.
+
+See [Claude Code requests](#claude-code-requests) for what the relay changes and its limits.
 
 ## Installation
 
@@ -322,6 +358,18 @@ Activation uses the menubar's quota-window selection and rounded 100% remaining 
 Requests up to 256 KiB are replayed from memory by default; larger requests use a temporary file, and all bodies have a hard cap. HTTP requests support identity and zstd content encodings. Both compressed and decoded sizes must fit the request cap; decoded bytes count toward the shared spool limit. Invalid compressed streams return 400, oversized requests return 413, and unsupported or stacked encodings return 415 before upstream dispatch. Responses and upgraded streams are forwarded with backpressure. The Responses WebSocket modes may briefly buffer lifecycle metadata as described below; model output is never retained for retry.
 
 Allocation instrumentation is disabled in normal builds. For a diagnostic daemon, build with `mbx build --release --locked --features memory-diagnostics`; `comradex status --json` then includes a `memory` object and text status shows live/peak allocation counters. These size-only counters exclude native-library allocations and allocator fragmentation; bridge counters cover retained history and selected active buffers. Default builds use the standard allocator and omit the memory diagnostics from status.
+
+### Claude Code requests
+
+The Claude listener accepts native Claude Code subscription requests for Messages, token counting, model listing, and the startup probe. Supported entry points are the CLI, VS Code, and Claude Code launched by the TypeScript or Python Agent SDK. Requests from other clients, API keys, and inconsistent native identity are rejected; Comradex does not translate foreign harnesses or manufacture Claude Code headers. These checks establish compatibility, not proof of the calling executable.
+
+Prompts, tools, thinking, cache controls, beta headers, and response bytes pass through unchanged. Routing changes only the OAuth bearer, the account and device identity in `metadata.user_id`, and an already-present request checksum. Claude Code sends an empty account ID when it has no cached account profile; routing fills it with the selected account's ID.
+
+Sessions stay on their account. An explicit shared 5-hour or 7-day quota rejection can move a request to another account before its response is forwarded. Signed thinking, compaction, predecessor references, files, and containers stay with their original account, as does a session with another stream in flight; those requests wait for their account or return an error. Permission errors, ambiguous limits, and interrupted streams never move to another account.
+
+Background usage polling feeds the menubar's 5-hour and 7-day allowance and skips accounts with a confirmed active limit before sending inference. Throttling of the usage endpoint itself does not mark an account as limited; while it lasts, that account's checks back off from five minutes up to an hour.
+
+Comradex terminates TLS and uses its own HTTP client, so framing, header order, and TLS fingerprints differ from a direct Claude Code connection. Anthropic documents gateway use through `ANTHROPIC_BASE_URL`, but pooling substitutes one subscription's credentials for another's. Comradex cannot guarantee that Anthropic will not restrict accounts used this way.
 
 ### Responses WebSocket modes
 

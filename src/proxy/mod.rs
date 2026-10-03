@@ -3,6 +3,7 @@ mod accepted_retry;
 mod accepted_retry_tests;
 #[cfg(test)]
 mod account_pin_tests;
+mod claude;
 #[cfg(test)]
 mod compression_tests;
 mod context;
@@ -834,6 +835,7 @@ impl Drop for DirectAccountLease {
 }
 
 pub struct App {
+    claude: claude::Claude,
     config: Arc<Config>,
     router: Arc<Router>,
     client: HttpClient,
@@ -889,6 +891,7 @@ impl App {
         let mut auth = auth::Resolver::new(&config);
         auth.health = router.auth_health.clone();
         Ok(Arc::new(Self {
+            claude: claude::Claude::new(&config)?,
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             bridge_turn_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             upgrade_slots: Arc::new(Semaphore::new(config.proxy.max_upgrades)),
@@ -984,16 +987,19 @@ impl App {
                 }
             }
         }
+        self.refresh_claude_credentials_at(now).await;
     }
 
     pub async fn run_usage_refresh(&self, requested: Arc<Notify>) {
         let mut retry_delay = Duration::from_secs(5);
+        let mut forced = false;
         loop {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let succeeded = self.refresh_managed_usage_at(now).await;
+            let succeeded = self.refresh_managed_usage_at(now).await
+                & self.refresh_claude_usage_at(now, forced).await;
             // A daemon can start before DNS/network service is ready. Failed checks
             // must recover independently of inference traffic or the normal poll.
             let delay = if succeeded {
@@ -1004,10 +1010,10 @@ impl App {
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
                 delay
             };
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {},
-                _ = requested.notified() => {},
-            }
+            forced = tokio::select! {
+                _ = tokio::time::sleep(delay) => false,
+                _ = requested.notified() => true,
+            };
         }
     }
 
@@ -1279,6 +1285,16 @@ impl App {
     ) -> Result<Response<ProxyBody>, Infallible> {
         let response = if self.service_health_path(req.uri()) {
             self.health_response()
+        } else if self.config.is_claude_pool(&listener.pool) {
+            self.handle_claude(req, &listener)
+                .await
+                .unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "claude_proxy_error",
+                        "Claude request could not be completed; check account status",
+                    )
+                })
         } else {
             match self.authorized_path(req.uri()) {
                 None => error_response(StatusCode::NOT_FOUND, "not_found", "unknown proxy path"),

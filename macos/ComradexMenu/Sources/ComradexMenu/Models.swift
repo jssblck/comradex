@@ -63,6 +63,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     let resetCredits: ResetCreditsSnapshot?
 
     var id: String { name }
+    var isClaude: Bool { kind.lowercased().hasPrefix("claude_") }
     var isSignedIn: Bool {
         signedIn ?? ["signed_in", "authenticated", "ready"].contains(authState?.lowercased())
     }
@@ -198,6 +199,8 @@ enum LoginState: String, Codable, Sendable {
 }
 
 struct LoginSnapshot: Codable, Equatable, Sendable {
+    let provider: String
+    var isClaude: Bool { provider == "claude" }
     let account: String
     let sessionID: String?
     let state: LoginState
@@ -209,6 +212,7 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
         switch state {
         case .idle, .notStarted: return "Idle"
         case .running:
+            if isClaude { return "Complete sign-in in your browser" }
             return userCode?.isEmpty == false ? "Waiting for device authorization" : "Requesting a device code"
         case .succeeded: return "Signed in"
         case .failed: return "Login failed"
@@ -217,6 +221,7 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
 
     init(
         account: String,
+        provider: String = "codex",
         sessionID: String? = nil,
         state: LoginState,
         verificationURI: String? = nil,
@@ -224,6 +229,7 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
         error: String? = nil
     ) {
         self.account = account
+        self.provider = provider
         self.sessionID = sessionID
         self.state = state
         self.verificationURI = verificationURI
@@ -232,7 +238,7 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case account, state, error
+        case account, state, error, provider
         case sessionID = "session_id"
         case verificationURI = "verification_uri"
         case userCode = "user_code"
@@ -240,6 +246,7 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? "codex"
         account = try container.decodeIfPresent(String.self, forKey: .account) ?? ""
         sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
         state = try container.decodeIfPresent(LoginState.self, forKey: .state) ?? .idle
@@ -249,6 +256,16 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
     }
 
     var safeVerificationURL: URL {
+        if isClaude {
+            if let verificationURI, let url = URL(string: verificationURI),
+               url.scheme == "https",
+               (url.host == "claude.ai" && url.path == "/oauth/authorize")
+                   || (url.host == "claude.com" && url.path == "/cai/oauth/authorize"),
+               url.user == nil, url.password == nil, url.port == nil {
+                return url
+            }
+            return URL(string: "https://claude.ai/login")!
+        }
         guard let verificationURI,
               let url = URL(string: verificationURI),
               url.scheme?.lowercased() == "https",
