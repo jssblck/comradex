@@ -76,6 +76,73 @@ The usage worker checks every five minutes; the menubar's Refresh requests an ea
 
 See [Claude Code requests](#claude-code-requests) for what the relay changes and its limits.
 
+## Usage endpoint
+
+Comradex's loopback Codex and Claude listeners expose a usage endpoint that
+reports quota windows and reset credits for all managed accounts. It implements
+a subset of the CLIProxyAPI management API, so clients that read usage from
+CLIProxyAPI can read it from Comradex.
+
+To connect a client, give it:
+
+- a listener's origin, such as `http://127.0.0.1:10101`, as the server URL.
+- `proxy.installation_secret` from `comradex.toml` as the management key.
+
+Use the listener origin without the secret path or `/v1` suffix. The Desktop
+backend listener does not expose this API. Accounts use their Comradex names;
+accounts that forward the requesting client's login are excluded. Account
+emails are included when available, so clients can deduplicate subscriptions
+they also read from other sources. Codex plan metadata is included when available.
+
+All management endpoints require `Authorization: Bearer <installation_secret>`:
+
+- `GET /v0/management/auth-files` lists account IDs, providers, and selectors.
+- `POST /v0/management/api-call` accepts the operations below.
+- `POST /v0/management/reset-quota` accepts `{"auth_index":"<account>"}`. It
+  refreshes Codex usage and acknowledges the cooldown cleared by redemption.
+  It cannot independently clear a quota block.
+
+The API-call body uses `auth_index`, `method`, `url`, and, for redemption, a
+JSON-encoded `data` string. Responses contain `status_code`, `header`, and a
+JSON-encoded `body` string. Caller-supplied headers are not forwarded; Comradex
+uses the selected account's own credentials. No request can fall back to another
+account, and arbitrary provider URLs are rejected.
+
+| Provider | Method | URL |
+| --- | --- | --- |
+| Codex | GET | `https://chatgpt.com/backend-api/wham/usage` |
+| Codex | GET | `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits` |
+| Codex | POST | `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume` |
+| Claude | GET | `https://api.anthropic.com/api/oauth/usage` |
+| Claude | GET | `https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1` |
+
+Quota windows use Comradex's latest observations. The response's
+`header.X-Comradex-Usage-Updated-At`, when available, records their observation
+time as Unix seconds. Accounts awaiting usage or sign-in return an unavailable
+result. Token credentials are never returned.
+
+Codex reset-credit reads fetch the selected account's current provider data.
+To redeem a reset, a client POSTs to the consume URL with `credit_id` and a UUID
+`redeem_request_id` in `data`. Keep the same request ID when retrying an
+uncertain result. Comradex does not retry redemption automatically. Management,
+CLI, and menu redemption share the same account lock and retry state. Confirmed
+results are returned without another consumption request. A confirmed reset or
+reconciliation of the original uncertain attempt clears its quota cooldown and
+old usage; newer rejections and account changes are preserved. Other provider
+outcomes and errors leave the cooldown intact.
+
+Claude's normal background usage poll requests reset-credit metadata and
+preserves the provider's `cedar_ember` block in both supported usage responses.
+The existing polling cadence and throttling backoff still apply. Reading the
+cached Claude response makes no extra provider request. The data remains tied
+to the credential's account identity and is replaced on the next successful poll.
+Clients that understand this block can show Claude reset credits. Claude
+redemption is not implemented.
+
+Reading usage or reset-credit availability never consumes a reset. Other
+CLIProxyAPI management operations are unsupported. Configure inference routing
+separately as described above.
+
 ## Installation
 
 ### Prebuilt binaries

@@ -136,18 +136,21 @@ impl App {
     ) -> Result<(UsageSnapshot, auth::Credential)> {
         let mut credential = self.claude.auth.resolve(home, None).await?;
         for attempt in 0..2 {
-            let request = Request::get(&self.claude.usage_url)
-                .header(
-                    "authorization",
-                    format!("Bearer {}", credential.access_token),
-                )
-                .header("anthropic-beta", "oauth-2025-04-20")
-                .header(
-                    "user-agent",
-                    concat!("comradex/", env!("CARGO_PKG_VERSION")),
-                )
-                .header("content-type", "application/json")
-                .body(bytes_body(Bytes::new()))?;
+            let request = Request::get(format!(
+                "{}?cedar_ember=1&skip_spend=1",
+                self.claude.usage_url
+            ))
+            .header(
+                "authorization",
+                format!("Bearer {}", credential.access_token),
+            )
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header(
+                "user-agent",
+                concat!("comradex/", env!("CARGO_PKG_VERSION")),
+            )
+            .header("content-type", "application/json")
+            .body(bytes_body(Bytes::new()))?;
             let (status, headers, bytes) = tokio::time::timeout(Duration::from_secs(8), async {
                 let response = self.claude.client.request(request).await?;
                 let (parts, body) = response.into_parts();
@@ -195,6 +198,8 @@ impl App {
                 status.as_u16()
             );
             let snapshot = parse_usage(&bytes, now)?;
+            self.observe_claude_reset_credits(account, credential.owner(), &bytes)
+                .await;
             self.router
                 .observe_claude_usage_for_owner(account, snapshot.clone(), &credential.owner())
                 .await;

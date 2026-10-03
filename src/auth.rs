@@ -798,7 +798,7 @@ fn jwt_account_id(token: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn jwt_payload(token: &str) -> Option<Value> {
+pub(crate) fn jwt_payload(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&decoded).ok()

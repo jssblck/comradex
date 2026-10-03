@@ -707,7 +707,7 @@ mod tests {
                                     )
                                     .unwrap()
                                     .to_rfc3339();
-                                    let data = json!({"five_hour":{"utilization":if first {100}else{25},"resets_at":reset},"seven_day":{"utilization":10,"resets_at":reset}});
+                                    let data = json!({"five_hour":{"utilization":if first {100}else{25},"resets_at":reset},"seven_day":{"utilization":10,"resets_at":reset},"cedar_ember":{"eligible":true,"next_grant_id":"mock-grant","grants":[{"id":"mock-grant","resets_left":2,"usable_now":true}]}});
                                     Response::builder()
                                         .status(if status == StatusCode::TOO_MANY_REQUESTS {
                                             status
@@ -1425,6 +1425,27 @@ kind="claude_inbound"
             assert_eq!(response.bytes().await.unwrap(), STREAM);
             assert_eq!(harness.seen.lock().await.last().unwrap().1, body);
         }
+        harness.close().await;
+    }
+    #[tokio::test]
+    async fn background_usage_poll_collects_claude_reset_data_without_claiming() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        assert!(
+            harness
+                .app
+                .refresh_claude_usage_at(auth::now(), false)
+                .await
+        );
+        for account in ["grace", "ada"] {
+            let credits = harness.app.claude_reset_credits(account).await.unwrap();
+            assert_eq!(credits["grants"][0]["resets_left"], 2);
+        }
+        let seen = harness.seen.lock().await;
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|request| request.2
+            == "/api/oauth/usage?cedar_ember=1&skip_spend=1"
+            && request.1.is_empty()));
+        drop(seen);
         harness.close().await;
     }
 }
