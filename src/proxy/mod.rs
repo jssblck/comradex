@@ -104,6 +104,7 @@ const BRIDGE_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 const BRIDGE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_UPSTREAM_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_UPSTREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNSTREAM_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UNKNOWN_CONTENT_SNIFF_BYTES: usize = 4 * 1024;
 const SSE_DECODE_SLICE_BYTES: usize = 64 * 1024;
@@ -1266,16 +1267,43 @@ impl App {
         tcp: TcpListener,
     ) -> Result<()> {
         info!(listener = %name, address = %listener.address, pool = %listener.pool, "listening");
+        let connections = Arc::new(Semaphore::new(
+            self.config
+                .proxy
+                .max_inflight
+                .saturating_add(self.config.proxy.max_upgrades)
+                .saturating_add(self.config.proxy.max_bridge_sessions),
+        ));
         loop {
             let (stream, _) = tcp.accept().await?;
+            let Ok(connection) = connections.clone().try_acquire_owned() else {
+                continue;
+            };
             let app = self.clone();
             let listener = listener.clone();
             self.spawn_tracked(async move {
-                let service = service_fn(move |req| app.clone().handle(req, listener.clone()));
-                if let Err(e) = Builder::new(TokioExecutor::new())
-                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                    .await
-                {
+                let _connection = connection;
+                let first_request = Arc::new(Notify::new());
+                let request_seen = first_request.clone();
+                let service = service_fn(move |req| {
+                    request_seen.notify_one();
+                    app.clone().handle(req, listener.clone())
+                });
+                let mut builder = Builder::new(TokioExecutor::new());
+                builder
+                    .http1()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(DOWNSTREAM_HEADER_READ_TIMEOUT);
+                let serving = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+                tokio::pin!(serving);
+                // Hyper sniffs the HTTP version before applying its HTTP/1 header timeout.
+                // Bound that phase, including silent sockets and partial HTTP/2 prefaces.
+                let result = tokio::select! {
+                    result = &mut serving => Some(result),
+                    _ = first_request.notified() => Some(serving.await),
+                    _ = tokio::time::sleep(DOWNSTREAM_HEADER_READ_TIMEOUT) => None,
+                };
+                if let Some(Err(e)) = result {
                     warn!(error = %e, "client connection ended");
                 }
             })
@@ -6864,6 +6892,118 @@ mod tests {
         assert_eq!(stats.inflight_http.load(Ordering::Relaxed), 0);
 
         drop(stream);
+        proxy.abort();
+    }
+
+    fn limited_connection_test_app(dir: &std::path::Path) -> (Arc<App>, ListenerConfig) {
+        let (app, listener, router, stats) = direct_test_app(dir);
+        let mut config = (*app.config).clone();
+        config.proxy.max_inflight = 1;
+        config.proxy.max_upgrades = 1;
+        config.proxy.max_bridge_sessions = 1;
+        (
+            App::new_unvalidated(Arc::new(config), router, stats).unwrap(),
+            listener,
+        )
+    }
+
+    #[tokio::test]
+    async fn incomplete_headers_are_bounded_and_released_on_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, mut listener) = limited_connection_test_app(dir.path());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.address = tcp.local_addr().unwrap();
+        let proxy = tokio::spawn(
+            app.clone()
+                .serve_tcp("default".into(), listener.clone(), tcp),
+        );
+
+        let mut stalled = Vec::new();
+        for request_prefix in [
+            b"".as_slice(),
+            b"PRI * HTTP/2.0\r\n".as_slice(),
+            b"GET /".as_slice(),
+        ] {
+            let mut stream = TcpStream::connect(listener.address).await.unwrap();
+            stream.write_all(request_prefix).await.unwrap();
+            stalled.push(stream);
+        }
+        let mut rejected = TcpStream::connect(listener.address).await.unwrap();
+        rejected
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = [0; 128];
+        let read = tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut response))
+            .await
+            .expect("excess connection was not closed");
+        assert!(matches!(read, Ok(0) | Err(_)));
+
+        drop(stalled.pop());
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut stream = TcpStream::connect(listener.address).await.unwrap();
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut response = [0; 128];
+                if let Ok(Ok(size)) =
+                    tokio::time::timeout(Duration::from_millis(100), stream.read(&mut response))
+                        .await
+                    && size > 0
+                {
+                    break response[..size].to_vec();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("released connection slot was not reused");
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+
+        drop(stalled);
+        app.shutdown_connections().await;
+        proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn pre_request_connections_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, mut listener) = limited_connection_test_app(dir.path());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.address = tcp.local_addr().unwrap();
+        let proxy = tokio::spawn(
+            app.clone()
+                .serve_tcp("default".into(), listener.clone(), tcp),
+        );
+        let mut stalled = Vec::new();
+        for request_prefix in [
+            b"".as_slice(),
+            b"PRI * HTTP/2.0\r\n".as_slice(),
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_slice(),
+        ] {
+            let mut stream = TcpStream::connect(listener.address).await.unwrap();
+            stream.write_all(request_prefix).await.unwrap();
+            stalled.push(stream);
+        }
+        for mut stream in stalled {
+            let mut response = [0; 128];
+            tokio::time::timeout(
+                DOWNSTREAM_HEADER_READ_TIMEOUT + Duration::from_secs(2),
+                async {
+                    while let Ok(size) = stream.read(&mut response).await {
+                        if size == 0 {
+                            break;
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("connection without a request did not time out");
+        }
+
+        app.shutdown_connections().await;
         proxy.abort();
     }
 
