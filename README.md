@@ -321,6 +321,8 @@ Activation uses the menubar's quota-window selection and rounded 100% remaining 
 
 Requests up to 256 KiB are replayed from memory by default; larger requests use a temporary file, and all bodies have a hard cap. HTTP requests support identity and zstd content encodings. Both compressed and decoded sizes must fit the request cap; decoded bytes count toward the shared spool limit. Invalid compressed streams return 400, oversized requests return 413, and unsupported or stacked encodings return 415 before upstream dispatch. Responses and upgraded streams are forwarded with backpressure. The Responses WebSocket modes may briefly buffer lifecycle metadata as described below; model output is never retained for retry.
 
+Allocation instrumentation is disabled in normal builds. For a diagnostic daemon, build with `mbx build --release --locked --features memory-diagnostics`; `comradex status --json` then includes a `memory` object and text status shows live/peak allocation counters. These size-only counters exclude native-library allocations and allocator fragmentation; bridge counters cover retained history and selected active buffers. Default builds use the standard allocator and omit the memory diagnostics from status.
+
 ### Responses WebSocket modes
 
 Select behavior with `proxy.responses_websocket_mode`:
