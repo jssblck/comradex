@@ -9,6 +9,11 @@ final class ComradexStore: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var updatingPool: String?
     @Published private(set) var connectingAccount: String?
+    @Published private(set) var resettingAccount: String?
+    @Published private(set) var resetMessage: String?
+    @Published private(set) var resetDetail: String?
+    @Published private(set) var pendingResetCredits: [String: [String: ResetCreditSnapshot]] = [:]
+    private var resetRequestIDs: [String: String] = [:]
     @Published private(set) var errorMessage: String?
     @Published private(set) var actionErrorMessage: String?
     @Published private(set) var lastSuccessfulRefresh: Date?
@@ -27,7 +32,7 @@ final class ComradexStore: ObservableObject {
     deinit { loginTask?.cancel() }
 
     func refresh(fetchUsage: Bool = false) async {
-        guard !isRefreshing, updatingPool == nil else { return }
+        guard !isRefreshing, updatingPool == nil, resettingAccount == nil else { return }
         let generation = statusGeneration
         isRefreshing = true
         defer { isRefreshing = false }
@@ -59,7 +64,7 @@ final class ComradexStore: ObservableObject {
     }
 
     func setPreferred(pool: String, account: String?) async {
-        guard updatingPool == nil else { return }
+        guard updatingPool == nil, resettingAccount == nil else { return }
         updatingPool = pool
         // A poll already in flight can contain the previous preference. Never let
         // it overwrite the authoritative read after the user's selection.
@@ -78,7 +83,7 @@ final class ComradexStore: ObservableObject {
     }
 
     func setAccountRole(pool: String, account: String, role: AccountRole) async {
-        guard updatingPool == nil, connectingAccount == nil else { return }
+        guard updatingPool == nil, connectingAccount == nil, resettingAccount == nil else { return }
         updatingPool = pool
         statusGeneration &+= 1
         defer { updatingPool = nil }
@@ -91,8 +96,39 @@ final class ComradexStore: ObservableObject {
         }
     }
 
+    // Called only after the native confirmation dialog. Reuse the ID after an
+    // ambiguous transport failure, and never choose a different credit on retry.
+    func useResetCredit(account: String, creditID: String) async {
+        guard resettingAccount == nil, updatingPool == nil, connectingAccount == nil, !isLoginRunning else { return }
+        let key = "\(account)\n\(creditID)"
+        let requestID = resetRequestIDs[key] ?? UUID().uuidString
+        let selectedCredit = pendingResetCredits[account]?[creditID]
+            ?? snapshot?.accounts.first(where: { $0.name == account })?.resetCredits?.credits?.first(where: { $0.id == creditID })
+        resetRequestIDs[key] = requestID
+        resettingAccount = account
+        resetMessage = nil
+        resetDetail = nil
+        actionErrorMessage = nil
+        statusGeneration &+= 1
+        defer { resettingAccount = nil }
+        do {
+            let result = try await client.useResetCredit(account: account, creditID: creditID, requestID: requestID)
+            resetRequestIDs[key] = nil
+            pendingResetCredits[account]?[creditID] = nil
+            resetMessage = "\(account): \(result.message)"
+            if let error = result.refreshError {
+                resetDetail = "Usage refresh failed: \(error)"
+            }
+        } catch {
+            if let selectedCredit { pendingResetCredits[account, default: [:]][creditID] = selectedCredit }
+            resetMessage = "Reset not confirmed for \(account) — retry from its reset menu"
+            resetDetail = "\(error.localizedDescription) Request ID: \(requestID)"
+        }
+        await readStatus(generation: statusGeneration)
+    }
+
     func beginLogin(account: String) {
-        guard !isLoginRunning else { return }
+        guard !isLoginRunning, resettingAccount == nil else { return }
         loginTask?.cancel()
         // A new attempt must not inherit the previous account's code or session.
         let provider = snapshot?.accounts.first(where: { $0.name == account })?.isClaude == true ? "claude" : "codex"
@@ -120,7 +156,7 @@ final class ComradexStore: ObservableObject {
     }
 
     func connectExistingLogin(account: String) async {
-        guard connectingAccount == nil, !isLoginRunning, updatingPool == nil else { return }
+        guard connectingAccount == nil, !isLoginRunning, updatingPool == nil, resettingAccount == nil else { return }
         connectingAccount = account
         defer { connectingAccount = nil }
         do {

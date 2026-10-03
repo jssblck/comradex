@@ -40,6 +40,7 @@ pub fn parse_usage(bytes: &[u8], now: u64) -> Result<UsageSnapshot> {
         );
     }
     Ok(UsageSnapshot {
+        reset_credits_available: None,
         observed_at_unix: now.min(i64::MAX as u64) as i64,
         windows,
     })
@@ -176,6 +177,7 @@ mod tests {
     use super::*;
     fn usage(now: i64, reset: i64, used: u8) -> UsageSnapshot {
         UsageSnapshot {
+            reset_credits_available: None,
             observed_at_unix: now,
             windows: BTreeMap::from([
                 (

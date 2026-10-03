@@ -50,6 +50,7 @@ pub fn snapshot(headers: &HeaderMap, now: u64) -> Option<UsageSnapshot> {
         );
     }
     (!windows.is_empty()).then_some(UsageSnapshot {
+        reset_credits_available: None,
         observed_at_unix: now as i64,
         windows,
     })

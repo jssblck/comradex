@@ -13,6 +13,15 @@ private final class AccountRoleAction: NSObject {
     }
 }
 
+private final class ResetCreditAction: NSObject {
+    let account: String
+    let credit: ResetCreditSnapshot
+    init(account: String, credit: ResetCreditSnapshot) {
+        self.account = account
+        self.credit = credit
+    }
+}
+
 @MainActor
 final class MenuBarController: NSObject, NSMenuDelegate {
     private let store: ComradexStore
@@ -116,6 +125,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             addInformationalItem("Connecting…", icon: "arrow.triangle.2.circlepath")
         }
 
+        if let message = store.resetMessage {
+            addInformationalItem(message, icon: "arrow.counterclockwise")
+            menu.items.last?.toolTip = store.resetDetail
+        }
         if let error = store.actionErrorMessage {
             addInformationalItem("Account change failed", icon: "exclamationmark.triangle.fill")
             menu.items.last?.toolTip = error
@@ -239,6 +252,43 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             connect.toolTip = "Reuse your local Codex login and show its usage."
             submenu.addItem(connect)
         }
+        let pendingResets = store.pendingResetCredits[account.name] ?? [:]
+        if account.resetCredits != nil || !pendingResets.isEmpty {
+            if !submenu.items.isEmpty { submenu.addItem(.separator()) }
+            let title = account.resetCredits.map { "\($0.availableCount()) resets available" }
+                ?? "Reset confirmation pending"
+            let resets = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let resetMenu = NSMenu()
+            resetMenu.autoenablesItems = false
+            if let error = account.resetCredits?.error {
+                let unavailable = NSMenuItem(title: "Credit details unavailable — Refresh to retry", action: nil, keyEquivalent: "")
+                unavailable.toolTip = error
+                unavailable.isEnabled = false
+                resetMenu.addItem(unavailable)
+            }
+            var listedCredits = (account.resetCredits?.credits ?? []).filter { $0.isAvailable() }
+            for credit in pendingResets.values.sorted(by: { $0.id < $1.id })
+                where !listedCredits.contains(where: { $0.id == credit.id }) {
+                listedCredits.append(credit)
+            }
+            for credit in listedCredits {
+                let isRetry = pendingResets[credit.id] != nil
+                let title = "\(isRetry ? "Retry " : "")\(credit.displayTitle) · \(credit.expiryDescription)"
+                let use = actionItem(title: title,
+                    action: #selector(useResetSelected(_:)),
+                    enabled: (isRetry || credit.canRedeem()) && account.isSignedIn && !account.isInbound
+                        && !account.isLoginInProgress && !account.needsLoginAction
+                        && store.resettingAccount == nil && store.updatingPool == nil
+                        && store.connectingAccount == nil && !store.isLoginRunning && store.errorMessage == nil)
+                use.representedObject = ResetCreditAction(account: account.name, credit: credit)
+                use.toolTip = [credit.description, "Granted \(credit.grantedAt)", "Status: \(credit.status)"]
+                    .compactMap { $0 }.joined(separator: "\n")
+                resetMenu.addItem(use)
+            }
+            resets.submenu = resetMenu
+            resets.isEnabled = !resetMenu.items.isEmpty
+            submenu.addItem(resets)
+        }
         if !submenu.items.isEmpty { item.submenu = submenu }
         menu.addItem(item)
     }
@@ -296,6 +346,33 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         Task { [weak self] in
             guard let self else { return }
             await store.setAccountRole(pool: selection.pool, account: selection.account, role: selection.role)
+            rebuildMenu()
+        }
+    }
+
+    static func resetConfirmation(account: String, credit: ResetCreditSnapshot, isRetry: Bool = false) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = isRetry ? "Retry the reset for \(account)?" : "Use a reset for \(account)?"
+        let explanation = isRetry
+            ? "This retries the original request for this credit. If it already succeeded, no additional credit will be used. Otherwise, this may consume the selected credit."
+            : "This consumes one reset credit for this account and resets its eligible usage limits."
+        alert.informativeText = "\(credit.displayTitle)\n\(credit.expiryDescription)\n\n\(explanation)"
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: isRetry ? "Retry Reset" : "Use Reset")
+        return alert
+    }
+
+    @objc private func useResetSelected(_ sender: NSMenuItem) {
+        guard let selection = sender.representedObject as? ResetCreditAction,
+              store.resettingAccount == nil else { return }
+        let isRetry = store.pendingResetCredits[selection.account]?[selection.credit.id] != nil
+        guard isRetry || selection.credit.canRedeem() else { return }
+        let alert = Self.resetConfirmation(account: selection.account, credit: selection.credit, isRetry: isRetry)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await store.useResetCredit(account: selection.account, creditID: selection.credit.id)
             rebuildMenu()
         }
     }

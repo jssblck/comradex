@@ -69,6 +69,15 @@ enum Request {
     },
     UiStatus,
     UiRefreshUsage,
+    UiResetCredits {
+        account: String,
+    },
+    UiUseResetCredit {
+        account: String,
+        credit_id: String,
+        request_id: String,
+        confirm: bool,
+    },
     UiSetAccountRole {
         pool: String,
         account: String,
@@ -99,6 +108,8 @@ impl Request {
             | Self::RoutingStatus { secret } => Some(secret),
             Self::UiStatus
             | Self::UiRefreshUsage
+            | Self::UiResetCredits { .. }
+            | Self::UiUseResetCredit { .. }
             | Self::UiSetAccountRole { .. }
             | Self::UiSetPreferred { .. }
             | Self::UiStartLogin { .. }
@@ -119,6 +130,10 @@ struct Response {
     status: Option<UiStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     login: Option<UiLoginStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_result: Option<crate::reset_credits::ResetResult>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,6 +162,8 @@ pub struct UiAccountStatus {
     pub usage_updated_at_unix: Option<i64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usage_windows: BTreeMap<String, crate::routing::QuotaWindowStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -367,7 +384,20 @@ impl LoginManager {
         let task = tokio::spawn(async move {
             let result: Result<bool> = async {
                 let _auth_lock = HomeAuthLock::acquire_async(&home).await?;
-                manager.runner.run(home, output.clone(), claude).await
+                if !manager
+                    .runner
+                    .run(home.clone(), output.clone(), claude)
+                    .await?
+                {
+                    return Ok(false);
+                }
+                // A successful child exit can still leave credentials in Keychain or
+                // no usable file at all. Check while login still owns the home lock.
+                Ok(if claude {
+                    crate::claude::auth::read(&home).is_ok()
+                } else {
+                    crate::auth::validate_existing_login(&home).is_ok()
+                })
             }
             .await;
             let state = match &result {
@@ -476,8 +506,7 @@ impl LoginManager {
 async fn run_codex_login(home: PathBuf, output: SharedLoginOutput) -> Result<bool> {
     let executable = resolve_codex_executable()?;
     let mut child = Command::new(&executable)
-        .arg("login")
-        .arg("--device-auth")
+        .args(accounts::CODEX_DEVICE_LOGIN_ARGS)
         .env("CODEX_HOME", &home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -607,6 +636,7 @@ impl Drop for SocketGuard {
 }
 
 struct ConfigChanges {
+    app: Option<Arc<crate::proxy::App>>,
     edit_lock: Mutex<()>,
     reload: Arc<Notify>,
     usage_refresh: Arc<Notify>,
@@ -655,12 +685,20 @@ impl ControlServer {
             stats,
             login_manager,
             changes: Arc::new(ConfigChanges {
+                app: None,
                 edit_lock: Mutex::new(()),
                 reload: Arc::new(Notify::new()),
                 usage_refresh: Arc::new(Notify::new()),
             }),
             clients: Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS)),
         })
+    }
+
+    pub fn with_app(mut self, app: Arc<crate::proxy::App>) -> Self {
+        Arc::get_mut(&mut self.changes)
+            .expect("server has not started")
+            .app = Some(app);
+        self
     }
 
     pub fn reload_requested(&self) -> Arc<Notify> {
@@ -762,6 +800,8 @@ async fn handle(
             routing: None,
             status: None,
             login: None,
+            reset_credits: None,
+            reset_result: None,
         }
     } else {
         match serde_json::from_slice::<Request>(&bytes) {
@@ -777,7 +817,7 @@ async fn handle(
                     &router,
                     &stats,
                     &login_manager,
-                    &changes.edit_lock,
+                    &changes,
                 )
                 .await
             }
@@ -787,6 +827,8 @@ async fn handle(
                 routing: None,
                 status: None,
                 login: None,
+                reset_credits: None,
+                reset_result: None,
             },
         }
     };
@@ -818,8 +860,9 @@ async fn process(
     router: &Router,
     stats: &Stats,
     login_manager: &LoginManager,
-    edit_lock: &Mutex<()>,
+    changes: &ConfigChanges,
 ) -> Response {
+    let edit_lock = &changes.edit_lock;
     if let Some(secret) = request.secret()
         && !secrets_equal(secret, &config.proxy.installation_secret)
     {
@@ -853,6 +896,37 @@ async fn process(
                 )
                 .await?;
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
+            }
+            Request::UiResetCredits { account } => {
+                let app = changes
+                    .app
+                    .as_ref()
+                    .context("reset credit service unavailable")?;
+                let credits = app.read_reset_credits(&account).await?;
+                let mut response = Response::routing(router.routing_snapshot().await);
+                response.reset_credits = Some(credits);
+                response
+            }
+            Request::UiUseResetCredit {
+                account,
+                credit_id,
+                request_id,
+                confirm,
+            } => {
+                if !confirm {
+                    bail!("explicit confirmation is required to consume a reset credit");
+                }
+                let app = changes
+                    .app
+                    .as_ref()
+                    .context("reset credit service unavailable")?;
+                let result = app
+                    .use_reset_credit(&account, &credit_id, &request_id)
+                    .await?;
+                let mut response =
+                    Response::status(build_ui_status(config, router, stats, login_manager).await);
+                response.reset_result = Some(result);
+                response
             }
             Request::UiStatus | Request::UiRefreshUsage => {
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
@@ -893,6 +967,8 @@ impl Response {
             routing: None,
             status: None,
             login: None,
+            reset_credits: None,
+            reset_result: None,
         }
     }
 
@@ -903,6 +979,8 @@ impl Response {
             routing: Some(routing),
             status: None,
             login: None,
+            reset_credits: None,
+            reset_result: None,
         }
     }
 
@@ -913,6 +991,8 @@ impl Response {
             routing: None,
             status: Some(status),
             login: None,
+            reset_credits: None,
+            reset_result: None,
         }
     }
 
@@ -923,6 +1003,8 @@ impl Response {
             routing: None,
             status: None,
             login: Some(login),
+            reset_credits: None,
+            reset_result: None,
         }
     }
 }
@@ -1141,6 +1223,10 @@ async fn build_ui_status(
                     .account_states
                     .get(name)
                     .and_then(|state| state.usage_updated_at_unix),
+                reset_credits: routing
+                    .account_states
+                    .get(name)
+                    .and_then(|state| state.reset_credits.clone()),
                 usage_windows: routing
                     .account_states
                     .get(name)
@@ -1259,11 +1345,58 @@ pub fn routing_status(state_dir: &Path, secret: &str) -> Result<RoutingSnapshot>
     )
 }
 
+pub fn read_reset_credits(
+    state_dir: &Path,
+    account: &str,
+) -> Result<crate::reset_credits::ResetCreditsSnapshot> {
+    send_response(
+        state_dir,
+        &Request::UiResetCredits {
+            account: account.into(),
+        },
+    )?
+    .reset_credits
+    .context("control response omitted reset credits")
+}
+
+pub fn use_reset_credit(
+    state_dir: &Path,
+    account: &str,
+    credit_id: &str,
+    request_id: &str,
+) -> Result<crate::reset_credits::ResetResult> {
+    send_response(
+        state_dir,
+        &Request::UiUseResetCredit {
+            account: account.into(),
+            credit_id: credit_id.into(),
+            request_id: request_id.into(),
+            confirm: true,
+        },
+    )?
+    .reset_result
+    .context("control response omitted reset result")
+}
+
 fn send(state_dir: &Path, request: &Request) -> Result<RoutingSnapshot> {
+    send_response(state_dir, request)?
+        .routing
+        .context("control response omitted routing status")
+}
+
+fn send_response(state_dir: &Path, request: &Request) -> Result<Response> {
     let path = socket_path(state_dir);
     let mut stream = StdUnixStream::connect(&path)
         .with_context(|| format!("connect to running daemon at {}", path.display()))?;
-    stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
+    let timeout = if matches!(
+        request,
+        Request::UiResetCredits { .. } | Request::UiUseResetCredit { .. }
+    ) {
+        Duration::from_secs(120)
+    } else {
+        CLIENT_TIMEOUT
+    };
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
@@ -1279,9 +1412,7 @@ fn send(state_dir: &Path, request: &Request) -> Result<RoutingSnapshot> {
                 .unwrap_or_else(|| "control request failed".into())
         )
     }
-    response
-        .routing
-        .context("control response omitted routing status")
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -1630,6 +1761,8 @@ kind = "inbound"
     #[derive(Clone, Copy)]
     enum FakeLoginOutcome {
         Success,
+        SuccessWithoutCredentials,
+        SuccessWithMalformedCredentials,
         ExitFailure,
         RunnerError,
     }
@@ -1642,7 +1775,7 @@ kind = "inbound"
     }
 
     impl LoginRunner for FakeLoginRunner {
-        fn run(&self, home: PathBuf, output: SharedLoginOutput, _claude: bool) -> LoginFuture {
+        fn run(&self, home: PathBuf, output: SharedLoginOutput, claude: bool) -> LoginFuture {
             let started = self.started.clone();
             let finish = self.finish.clone();
             let bytes = self.output.clone();
@@ -1656,7 +1789,39 @@ kind = "inbound"
                 started.notify_one();
                 finish.notified().await;
                 match outcome {
-                    FakeLoginOutcome::Success => Ok(true),
+                    FakeLoginOutcome::Success => {
+                        if claude {
+                            fs::write(
+                                home.join("claude-auth.json"),
+                                serde_json::to_vec(&serde_json::json!({
+                                    "access_token": "sk-ant-oat01-synthetic",
+                                    "refresh_token": "synthetic",
+                                    "expires_at": crate::claude::auth::now() + 3600,
+                                    "account_uuid": "11111111-1111-4111-8111-111111111111",
+                                    "organization_uuid": "22222222-2222-4222-8222-222222222222",
+                                    "device_id": "a".repeat(64)
+                                }))?,
+                            )?;
+                        } else {
+                            fs::write(
+                                home.join("auth.json"),
+                                r#"{"tokens":{"access_token":"test-access-token"}}"#,
+                            )?;
+                        }
+                        Ok(true)
+                    }
+                    FakeLoginOutcome::SuccessWithoutCredentials => Ok(true),
+                    FakeLoginOutcome::SuccessWithMalformedCredentials => {
+                        fs::write(
+                            home.join(if claude {
+                                "claude-auth.json"
+                            } else {
+                                "auth.json"
+                            }),
+                            "private malformed credentials",
+                        )?;
+                        Ok(true)
+                    }
                     FakeLoginOutcome::ExitFailure => Ok(false),
                     FakeLoginOutcome::RunnerError => bail!("private runner detail"),
                 }
@@ -1984,39 +2149,70 @@ path = "accounts/work"
 
     #[tokio::test]
     async fn managed_login_failure_is_stable_and_restores_routing_availability() {
-        for (outcome, expected_error) in [
-            (FakeLoginOutcome::ExitFailure, "codex_login_failed"),
-            (FakeLoginOutcome::RunnerError, "codex_login_unavailable"),
-        ] {
-            let (_dir, config, router) = managed_login_fixture();
-            let started = Arc::new(Notify::new());
-            let finish = Arc::new(Notify::new());
-            let manager = LoginManager::new(
-                Arc::new(FakeLoginRunner {
-                    started: started.clone(),
-                    finish: finish.clone(),
-                    output: b"internal detail that must not escape".to_vec(),
-                    outcome,
-                }),
-                router.clone(),
-            );
-            let home = managed_account_home(&config, "work").unwrap().to_owned();
-            let session = manager.start("work".to_owned(), home, false).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(1), started.notified())
-                .await
-                .unwrap();
-            finish.notify_one();
-            let completed = wait_for_login(&manager, &session.session_id).await;
-            assert_eq!(completed.state, UiLoginState::Failed);
-            assert_eq!(completed.error.as_deref(), Some(expected_error));
-            assert!(completed.verification_uri.is_none());
-            assert!(completed.user_code.is_none());
-            assert!(
-                router
-                    .select_exact(&config.pools["default"], "work")
+        for claude in [false, true] {
+            for (outcome, expected_error) in [
+                (
+                    FakeLoginOutcome::SuccessWithoutCredentials,
+                    "codex_login_failed",
+                ),
+                (
+                    FakeLoginOutcome::SuccessWithMalformedCredentials,
+                    "codex_login_failed",
+                ),
+                (FakeLoginOutcome::ExitFailure, "codex_login_failed"),
+                (FakeLoginOutcome::RunnerError, "codex_login_unavailable"),
+            ] {
+                let (_dir, mut config, mut router) = managed_login_fixture();
+                if claude {
+                    let home = managed_account_home(&config, "work").unwrap().to_owned();
+                    Arc::make_mut(&mut config).accounts.insert(
+                        "work".into(),
+                        crate::config::AccountConfig::ClaudeHome { path: home },
+                    );
+                    router = Arc::new(Router::new(&config, router.affinity.clone()));
+                }
+                let started = Arc::new(Notify::new());
+                let finish = Arc::new(Notify::new());
+                let manager = LoginManager::new(
+                    Arc::new(FakeLoginRunner {
+                        started: started.clone(),
+                        finish: finish.clone(),
+                        output: b"internal detail that must not escape".to_vec(),
+                        outcome,
+                    }),
+                    router.clone(),
+                );
+                let home = managed_account_home(&config, "work").unwrap().to_owned();
+                let session = manager
+                    .start("work".to_owned(), home, claude)
                     .await
-                    .is_some()
-            );
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(1), started.notified())
+                    .await
+                    .unwrap();
+                finish.notify_one();
+                let completed = wait_for_login(&manager, &session.session_id).await;
+                assert_eq!(completed.state, UiLoginState::Failed);
+                assert_eq!(
+                    completed.error.as_deref(),
+                    Some(
+                        if claude {
+                            expected_error.replace("codex", "claude")
+                        } else {
+                            expected_error.to_owned()
+                        }
+                        .as_str()
+                    )
+                );
+                assert!(completed.verification_uri.is_none());
+                assert!(completed.user_code.is_none());
+                assert!(
+                    router
+                        .select_exact(&config.pools["default"], "work")
+                        .await
+                        .is_some()
+                );
+            }
         }
     }
 

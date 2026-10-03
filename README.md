@@ -146,7 +146,7 @@ comradex account remove personal_2
 
 `account prefer <name>` immediately makes that account the first choice for new, unbound work in the default pool. Use `--pool <name>` for another pool and `--clear` to restore automatic selection. The daemon applies the change through an authenticated, user-only Unix socket and persists it in `comradex.toml`; it does not restart, interrupt active turns, or move sticky conversations. An unavailable, quota-limited, or over-threshold preferred account is skipped by the normal quota-aware fallback. If the daemon is not running, the preference is saved and takes effect on its next start.
 
-`account preserve <name>` reserves that account for last use in the pool. New, unbound work uses other eligible accounts first, even when their usage is above the rotation threshold. The preserved account remains available when all others are unavailable or excluded from a retry. Existing conversations keep their account bindings. Use `--pool <name>` to select a pool or `--clear` to remove preservation. Changes apply live without restarting the daemon and persist as `preserved` in the pool's configuration. A pool can prefer one account and preserve another; it cannot prefer and preserve the same account.
+`account preserve <name>` reserves that account for last use in the pool. New, unbound work uses other eligible accounts first, even when their usage is above the rotation threshold. The preserved account remains available when all others are unavailable, excluded from a retry, or reported at 100% usage. Accounts with exhausted included quota are excluded even when no other account is available. Existing conversations keep their account bindings while eligible. Use `--pool <name>` to select a pool or `--clear` to remove preservation. Changes apply live without restarting the daemon and persist as `preserved` in the pool's configuration. A pool can prefer one account and preserve another; it cannot prefer and preserve the same account.
 
 To pin a model or the model listing API to an account, edit the pool in `comradex.toml` and restart the daemon:
 
@@ -178,7 +178,9 @@ Then authenticate through the official client:
 comradex account login personal_2
 ```
 
-This executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`.
+This executes `codex -c 'cli_auth_credentials_store="file"' login --device-auth` with `CODEX_HOME` set to the isolated directory. Both CLI and menubar logins require a readable ChatGPT `auth.json` before reporting success. Absolute account paths are used unchanged; relative paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`.
+
+Keep managed account homes separate from a desktop Codex home that uses `auto` or `keyring` credential storage. Codex removes `auth.json` in that home when it saves credentials to Keychain, including after a later login or refresh. To use the same ChatGPT account in both applications, sign it into an isolated Comradex account home; the two logins then have independent storage and refresh tokens while sharing the account's quota.
 
 For each request, the daemon reads the account's `auth.json`, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. A bounded background sweep checks managed accounts once per minute and refreshes only tokens within five minutes of expiry, so rarely selected accounts do not depend on request-time refresh. Refreshes are single-flight per normalized, non-overlapping account home and atomically rotate `auth.json`; permanent refresh rejection marks only that account as requiring device login. This includes an existing Codex login explicitly connected as a `codex_home` account. Credentials forwarded by an `inbound` account remain unmanaged.
 
@@ -314,7 +316,7 @@ HTTP requests and the frame-aware WebSocket modes enforce file ownership found i
 
 ### Quotas, retries, and streaming
 
-Existing healthy bindings stay put after usage crosses `switch_at`, but fresh requests leave a soft binding at 100% usage. Hard account-owned continuations retain their owner.
+Existing healthy bindings stay put after usage crosses `switch_at`. A reported 100% included-quota window makes an account unavailable for both fresh work and continuations, even when paid credits would let upstream keep accepting requests. Selection and dispatch validation enforce the same cutoff. Portable work switches to an eligible account; hard account-owned continuations and configured pins stop if their owner is exhausted. An exhausted pool returns an error instead of falling back to credits. Keep `switch_at` below 100 (the default is 80) to move new work earlier; it remains a soft preference and does not interrupt an active answer.
 
 The default HTTP WebSocket bridge reconstructs a continued conversation from its cached input and completed output. When that history is portable, an exhausted previous account can be replaced automatically on the same client connection, including after a pre-output HTTP quota rejection or a bare quota error before `response.created`. The previous account remains preferred while healthy. Files, turn-state ownership, configured account pins, and nonportable context still prevent cross-account replay; missing cached history requires a full resend from the client. Account switching does not resume a partially delivered answer.
 
@@ -343,7 +345,9 @@ set `COMRADEX_PROBE_MODEL` to the configured client model and explicitly authori
 before running `mbx test --test native_reasoning_live -- --ignored --nocapture`. It logs only safe
 status metadata and keeps credentials, native items, and synthetic response text in memory.
 
-Quota cooldowns recover automatically on the next selection or status request. When upstream reports several quota windows, only windows explicitly reported at 100% constrain a quota rejection; unrelated longer windows do not keep the account blocked. In addition to observing usage headers on proxied responses, a background managed-account sweep fetches Codex's usage endpoint immediately at daemon startup and every five minutes afterward. The latest primary, secondary, and tertiary percentages, reset timestamps, and window durations appear under `routing.account_states.<account>.usage_windows`; `usage_updated_at_unix` records when that view was observed. Fetch failures are isolated per account and preserve the last good view. Fetched usage influences only fresh-work admission and does not create a hard quota cooldown without an upstream quota rejection.
+Quota cooldowns recover automatically on the next selection or status request. When upstream reports several quota windows, only windows explicitly reported at 100% constrain a quota rejection; unrelated longer windows do not keep the account blocked. In addition to observing usage headers on proxied responses, a background managed-account sweep fetches Codex's usage endpoint immediately at daemon startup and every five minutes afterward. The latest primary, secondary, and tertiary percentages, reset timestamps, and window durations appear under `routing.account_states.<account>.usage_windows`; `usage_updated_at_unix` records when that view was observed. Fetch failures are isolated per account and preserve the last good view. Fetched exhaustion blocks dispatch without requiring an upstream rejection. Every exhausted window must reset or report recovered usage before the account becomes eligible again; a missing reset deadline stays blocked until usage recovers. Partial headers preserve other windows and known reset deadlines.
+
+This cutoff uses observed usage. Requests already in flight, delayed or missing usage reports, and already-open raw WebSocket tunnels can still consume credits before Comradex observes or can enforce exhaustion; it is not a server-side spending cap. The default HTTP bridge checks each Responses request and can switch portable continuations on the same client connection.
 
 `comradex status` shows each healthy managed account's remaining quota and reset countdowns; authentication or availability errors replace stale usage details. `comradex status --json` exposes the underlying used percentages, availability, retry deadline, latest usage view, and separately tracked blocking quota windows. Neither Comradex nor Codex needs to be restarted when a quota window resets.
 
@@ -352,6 +356,8 @@ Weekly usage activation is **opt-in**. Set `auto_activate_weekly_usage = true` u
 Activation uses the menubar's quota-window selection and rounded 100% remaining value, requires a seven-day window with a reset within five minutes of a full week, and rechecks usage before sending. Requests run sequentially against each exact authenticated account, with no account fallback, tools, or stored conversation. Aliases for the same quota identity share an activation record. Successful requests are suppressed for the current weekly cycle even if usage still rounds to 100%; uncertain or failed attempts wait at least an hour before becoming eligible again. Each attempt has a 60-second timeout, and successful requests trigger another usage fetch. State is stored in `usage-activation.json` under the configured state directory; unreadable state disables activation while leaving usage polling and proxying operational.
 
 Requests up to 256 KiB are replayed from memory by default; larger requests use a temporary file, and all bodies have a hard cap. HTTP requests support identity and zstd content encodings. Both compressed and decoded sizes must fit the request cap; decoded bytes count toward the shared spool limit. Invalid compressed streams return 400, oversized requests return 413, and unsupported or stacked encodings return 415 before upstream dispatch. Responses and upgraded streams are forwarded with backpressure. The Responses WebSocket modes may briefly buffer lifecycle metadata as described below; model output is never retained for retry.
+
+Allocation instrumentation is disabled in normal builds. For a diagnostic daemon, build with `mbx build --release --locked --features memory-diagnostics`; `comradex status --json` then includes a `memory` object and text status shows live/peak allocation counters. These size-only counters exclude native-library allocations and allocator fragmentation; bridge counters cover retained history and selected active buffers. Default builds use the standard allocator and omit the memory diagnostics from status.
 
 ### Claude Code requests
 
@@ -451,5 +457,18 @@ comradex status --json
 ```
 
 `status` summarizes the configuration, LaunchAgent, Codex wiring, accounts, per-pool preferred and active accounts, and live traffic. While the daemon is running, routing status comes directly from its authenticated local control socket; the bounded `stats.json` snapshot is the fallback and is also updated periodically. `--json` prints that snapshot with the latest live routing state. When running from source, use `cargo run -- status`. There is deliberately no credentialed admin HTTP endpoint.
+
+Reset credits are tracked separately from quota-window resets. `comradex status` includes available reset counts and each credit's exact RFC3339 expiration timestamp; JSON exposes the server timestamps unchanged under `routing.account_states.<account>.reset_credits`. Credits refresh with the usage sweep and the menu's Refresh action. Expired credits are excluded from the displayed available count. A failed detail lookup is shown as unavailable, not as a zero balance.
+
+```sh
+comradex account reset-credits personal
+comradex account reset-credits personal --json
+# Explicitly consumes the selected credit:
+comradex account use-reset personal --credit-id CREDIT_ID --confirm
+```
+
+The read command fetches fresh data from the running daemon. The menu's account submenu contains **N resets available**; expanding it lists available credits with precise expiry. Clicking a credit directly opens a confirmation with Cancel selected by default. Redemption always names a specific account and credit, then refreshes usage. It never happens automatically. The CLI prints a request ID before submitting; if the outcome is unknown, refresh the credits and reuse that ID with `--request-id` when retrying. The menu retains the same request ID for retries during that app session. Inbound accounts must first be connected to a Codex login.
+
+The running daemon retains the most recent reset attempt per account. Explicit retries with the original identity, credit, and request ID can reconcile a consumed credit even if it disappears from the credit list; confirmed results are returned without another consumption request. Late confirmations never clear a newer quota rejection. This retry state lasts for the daemon's lifetime.
 
 The menu app communicates directly with the daemon through a local socket accessible only to your macOS user. It reads status, changes account settings, and starts the official Codex device-login flow. The app displays the login URL, authorization code, and progress without handling account credentials.

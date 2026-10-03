@@ -4,6 +4,7 @@ import Foundation
 enum UIControlCommand: Equatable, Sendable {
     case status
     case refreshUsage
+    case useResetCredit(account: String, creditID: String, requestID: String)
     case setAccountRole(pool: String, account: String, role: AccountRole)
     case setPreferred(pool: String, account: String?)
     case startLogin(account: String)
@@ -17,6 +18,9 @@ enum UIControlCommand: Equatable, Sendable {
             object = ["command": "ui_status"]
         case .refreshUsage:
             object = ["command": "ui_refresh_usage"]
+        case .useResetCredit(let account, let creditID, let requestID):
+            object = ["command": "ui_use_reset_credit", "account": account, "credit_id": creditID,
+                      "request_id": requestID, "confirm": true]
         case .setPreferred(let pool, let account):
             object = [
                 "command": "ui_set_preferred",
@@ -67,6 +71,7 @@ enum ControlSocketError: LocalizedError {
 protocol ControlServing: Sendable {
     func status() async throws -> UIStatusSnapshot
     func refreshUsage() async throws
+    func useResetCredit(account: String, creditID: String, requestID: String) async throws -> ResetResultSnapshot
     func setAccountRole(pool: String, account: String, role: AccountRole) async throws -> UIStatusSnapshot
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot?
     func startLogin(account: String) async throws -> LoginSnapshot
@@ -102,6 +107,11 @@ final class ControlSocketClient: ControlServing, @unchecked Sendable {
         _ = try Self.decode(UIStatusSnapshot.self, from: data, preferredKeys: ["status"])
     }
 
+    func useResetCredit(account: String, creditID: String, requestID: String) async throws -> ResetResultSnapshot {
+        let data = try await request(.useResetCredit(account: account, creditID: creditID, requestID: requestID))
+        return try Self.decode(ResetResultSnapshot.self, from: data, preferredKeys: ["reset_result"])
+    }
+
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? {
         _ = try await request(.setPreferred(pool: pool, account: account))
         return nil
@@ -132,8 +142,10 @@ final class ControlSocketClient: ControlServing, @unchecked Sendable {
     private func request(_ command: UIControlCommand) async throws -> Data {
         let path = socketPath
         let requestData = try command.encoded()
+        let timeoutSeconds: Int
+        if case .useResetCredit = command { timeoutSeconds = 120 } else { timeoutSeconds = 2 }
         return try await Task.detached(priority: .userInitiated) {
-            try Self.send(requestData, to: path)
+            try Self.send(requestData, to: path, timeoutSeconds: timeoutSeconds)
         }.value
     }
 
@@ -154,7 +166,7 @@ final class ControlSocketClient: ControlServing, @unchecked Sendable {
         return try JSONDecoder().decode(type, from: payloadData)
     }
 
-    static func send(_ data: Data, to path: String) throws -> Data {
+    static func send(_ data: Data, to path: String, timeoutSeconds: Int = 2) throws -> Data {
         let utf8 = Array(path.utf8CString)
         guard utf8.count <= MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
             throw ControlSocketError.invalidPath(path)
@@ -164,7 +176,7 @@ final class ControlSocketClient: ControlServing, @unchecked Sendable {
         guard descriptor >= 0 else { throw ControlSocketError.socketCreation(errno) }
         defer { Darwin.close(descriptor) }
 
-        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        var timeout = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
         setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         var noSignal: Int32 = 1
