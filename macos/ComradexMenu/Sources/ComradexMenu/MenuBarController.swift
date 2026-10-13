@@ -76,6 +76,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
+    func showMenu() {
+        statusItem?.button?.performClick(nil)
+    }
+
     func stopPolling() {
         pollingTask?.cancel()
         pollingTask = nil
@@ -135,6 +139,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             menu.items.last?.toolTip = error
         }
         menu.addItem(.separator())
+        if store.snapshot?.accounts.contains(where: \.isClaude) == true {
+            menu.addItem(claudeUsageItem())
+        }
         menu.addItem(actionItem(
             title: store.isRefreshing ? "Refreshing…" : "Refresh",
             icon: "arrow.clockwise",
@@ -294,6 +301,23 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(item)
     }
 
+    /// Chooses which Claude limit the account rows and desktop widget show.
+    private func claudeUsageItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Claude Usage", action: nil, keyEquivalent: "")
+        item.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: nil)
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        for window in ClaudeUsageWindow.allCases {
+            let choice = actionItem(title: window.title, action: #selector(claudeUsageSelected(_:)))
+            choice.state = window == store.claudeUsage ? .on : .off
+            choice.representedObject = window.rawValue
+            choice.toolTip = "Show this limit for Claude accounts here and in the desktop widget."
+            submenu.addItem(choice)
+        }
+        item.submenu = submenu
+        return item
+    }
+
     private func addInformationalItem(_ title: String, icon: String) {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
@@ -336,6 +360,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func refreshSelected(_ sender: NSMenuItem) {
         refreshStatus(fetchUsage: true)
+    }
+
+    @objc private func claudeUsageSelected(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let window = ClaudeUsageWindow(rawValue: raw) else { return }
+        store.setClaudeUsage(window)
+        rebuildMenu()
     }
 
     @objc private func quitSelected(_ sender: NSMenuItem) {
@@ -479,15 +509,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     private func usageDescription(_ account: AccountSnapshot, expanded: Bool) -> String? {
-        let windows = account.usageWindows
-            .filter { $0.value.usedPercent != nil && $0.value.limitWindowSeconds != 0 }
-            .sorted { left, right in
-                let leftOrder = windowOrder(left.key)
-                let rightOrder = windowOrder(right.key)
-                if leftOrder != rightOrder { return leftOrder < rightOrder }
-                return left.key < right.key
-            }
-        guard let window = windows.first?.value else {
+        guard let window = account.summaryWindowKey(claudeUsage: store.claudeUsage).flatMap({ account.usageWindows[$0] }) else {
             return account.usagePercent.map { "\(max(0, 100 - $0))% left" }
         }
         var detail = "\(max(0, 100 - window.usedPercent!))% left"
@@ -495,15 +517,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             detail += expanded ? " · resets in \(reset)" : " · \(reset)"
         }
         return detail
-    }
-
-    private func windowOrder(_ name: String) -> Int {
-        switch name.lowercased() {
-        case "primary": return 0
-        case "secondary": return 1
-        case "tertiary": return 2
-        default: return 3
-        }
     }
 
     private func retryDescription(_ retryAtUnix: Int64?) -> String? {

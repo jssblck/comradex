@@ -17,16 +17,34 @@ final class ComradexStore: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var actionErrorMessage: String?
     @Published private(set) var lastSuccessfulRefresh: Date?
+    @Published private(set) var claudeUsage: ClaudeUsageWindow
     private let logger = Logger(subsystem: "com.nicosuave.comradex.menu", category: "connection")
 
     var isLoginRunning: Bool { login?.state == .running }
 
     private let client: any ControlServing
+    private let widgetPublisher: WidgetUsagePublisher
+    private let defaults: UserDefaults
     private var loginTask: Task<Void, Never>?
     private var statusGeneration: UInt64 = 0
 
-    init(client: any ControlServing = ControlSocketClient()) {
+    init(
+        client: any ControlServing = ControlSocketClient(),
+        widgetPublisher: WidgetUsagePublisher? = nil,
+        defaults: UserDefaults = .standard
+    ) {
         self.client = client
+        self.widgetPublisher = widgetPublisher ?? WidgetUsagePublisher()
+        self.defaults = defaults
+        claudeUsage = defaults.string(forKey: ClaudeUsageWindow.defaultsKey).flatMap(ClaudeUsageWindow.init) ?? .fiveHour
+    }
+
+    /// A display preference only; routing still considers every quota window.
+    func setClaudeUsage(_ window: ClaudeUsageWindow) {
+        guard window != claudeUsage else { return }
+        claudeUsage = window
+        defaults.set(window.rawValue, forKey: ClaudeUsageWindow.defaultsKey)
+        if let snapshot { widgetPublisher.publish(snapshot, claudeUsage: window, userInitiated: true) }
     }
 
     deinit { loginTask?.cancel() }
@@ -189,6 +207,7 @@ final class ComradexStore: ObservableObject {
         snapshot = status
         lastSuccessfulRefresh = Date()
         errorMessage = nil
+        widgetPublisher.publish(status, claudeUsage: claudeUsage)
     }
 
     func apply(login value: LoginSnapshot) {
