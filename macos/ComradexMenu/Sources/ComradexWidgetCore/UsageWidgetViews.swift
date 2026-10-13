@@ -300,7 +300,7 @@ struct StaleFootnote: View {
     }
 }
 
-/// The title row of the large layouts, with freshness or an account summary.
+/// The title row of the large layouts, noting the data's age only when it is stale.
 struct UsageHeader: View {
     let snapshot: UsageSnapshot
     let date: Date
@@ -312,18 +312,8 @@ struct UsageHeader: View {
             Spacer()
             if let updated = updatedCaption(snapshot, at: date) {
                 StaleFootnote(text: updated)
-            } else {
-                Text(summary)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
             }
         }
-    }
-
-    private var summary: String {
-        let ready = snapshot.accounts.filter { $0.status == .available }.count
-        let total = snapshot.accounts.count
-        return ready == total ? "\(total) \(total == 1 ? "account" : "accounts")" : "\(ready) of \(total) ready"
     }
 }
 
