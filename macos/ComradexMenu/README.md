@@ -58,6 +58,8 @@ BUNDLE_ID=com.nicosuave.comradex.menu.dev URL_SCHEME=comradex-menu-dev \
   APP_IDENTITY="Developer ID Application: <name> (<team-id>)" Scripts/compile_and_run.sh
 ```
 
+macOS caches widget descriptions per bundle version and keeps widget processes running, so `compile_and_run.sh` stamps each build with a new build number and stops this checkout's old widget process. Remove and re-add a placed widget if its kind changed.
+
 The running daemon must implement `ui_status`, `ui_refresh_usage`, `ui_use_reset_credit`, `ui_set_account_role`, `ui_start_login`, and `ui_login_status` on its existing user-only control socket.
 
 ## CLI coexistence
