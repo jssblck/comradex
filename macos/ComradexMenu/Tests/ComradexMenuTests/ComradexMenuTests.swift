@@ -157,6 +157,44 @@ final class ComradexMenuTests: XCTestCase {
     }
 
     @MainActor
+    func testClaudeUsageChoiceSwitchesRowsAndPersists() throws {
+        let suite = "ComradexMenuTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Int64(Date().timeIntervalSince1970)
+        let claude = try decodeAccount("""
+        {"name":"claude","kind":"claude_home","signed_in":true,"auth_state":"signed_in","pools":["claude"],"usage_windows":{
+          "5h":{"used_percent":11,"reset_at_unix":\(now + 7_500),"limit_window_seconds":18000},
+          "7d":{"used_percent":40,"reset_at_unix":\(now + 5 * 86_400 + 7_500),"limit_window_seconds":604800}
+        }}
+        """)
+        let store = ComradexStore(client: StubClient(), defaults: defaults)
+        store.apply(status: UIStatusSnapshot(accounts: [claude]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("claude · 89% left · 2h") })
+        let usage = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "Claude Usage" })
+        let choices = try XCTUnwrap(usage.submenu).items
+        XCTAssertEqual(choices.map(\.title), ["5-Hour Limit", "Weekly Limit"])
+        XCTAssertEqual(choices.map(\.state), [.on, .off])
+
+        let weekly = choices[1]
+        try XCTUnwrap(weekly.target as? NSObject).perform(try XCTUnwrap(weekly.action), with: weekly)
+
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("claude · 60% left · 5d 2h") })
+        let updated = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "Claude Usage" }?.submenu)
+        XCTAssertEqual(updated.items.map(\.state), [.off, .on])
+        XCTAssertEqual(ComradexStore(client: StubClient(), defaults: defaults).claudeUsage, .weekly)
+
+        // The choice only appears when there is a Claude account to apply it to.
+        let codex = try decodeAccount(#"{"name":"sq","kind":"codex_home","signed_in":true,"auth_state":"signed_in"}"#)
+        store.apply(status: UIStatusSnapshot(accounts: [codex]))
+        controller.rebuildMenu()
+        XCTAssertFalse(controller.renderedMenu.items.contains { $0.title == "Claude Usage" })
+    }
+
+    @MainActor
     func testExhaustedQuotaKeepsPercentageAndResetCountdown() throws {
         let reset = Int64(Date().timeIntervalSince1970) + 5 * 86_400 + 12 * 3_600 + 120
         let cases = [

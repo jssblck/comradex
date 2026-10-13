@@ -125,6 +125,50 @@ struct UsageWindowSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// Which Claude usage limit the menu and widget show for each Claude account.
+enum ClaudeUsageWindow: String, CaseIterable, Sendable {
+    case fiveHour, weekly
+
+    static let defaultsKey = "ClaudeUsageWindow"
+
+    var title: String {
+        switch self {
+        case .fiveHour: return "5-Hour Limit"
+        case .weekly: return "Weekly Limit"
+        }
+    }
+}
+
+extension AccountSnapshot {
+    /// The usage window that summarizes this account: Claude's chosen limit, or
+    /// the provider's primary window. Zero-duration placeholder windows are skipped.
+    func summaryWindowKey(claudeUsage: ClaudeUsageWindow) -> String? {
+        let windows = usageWindows.filter { $0.value.usedPercent != nil && $0.value.limitWindowSeconds != 0 }
+        if isClaude {
+            let timed = windows.compactMap { key, window in window.limitWindowSeconds.map { (key: key, seconds: $0) } }
+            let byLength: ((key: String, seconds: UInt64), (key: String, seconds: UInt64)) -> Bool = {
+                $0.seconds != $1.seconds ? $0.seconds < $1.seconds : $0.key < $1.key
+            }
+            let chosen = claudeUsage == .fiveHour ? timed.min(by: byLength) : timed.max(by: byLength)
+            if let chosen { return chosen.key }
+        }
+        return windows.keys.min { left, right in
+            let leftOrder = Self.windowOrder(left)
+            let rightOrder = Self.windowOrder(right)
+            return leftOrder != rightOrder ? leftOrder < rightOrder : left < right
+        }
+    }
+
+    private static func windowOrder(_ name: String) -> Int {
+        switch name.lowercased() {
+        case "primary": return 0
+        case "secondary": return 1
+        case "tertiary": return 2
+        default: return 3
+        }
+    }
+}
+
 enum AccountRole: String, CaseIterable, Sendable {
     case normal, preferred, preserved
 

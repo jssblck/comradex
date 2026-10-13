@@ -2,7 +2,7 @@
 
 A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; changing each account's routing settings; and completing account login when authentication is required.
 
-Each account occupies one line with its usage and reset countdown, including connected `app` accounts: `app · 17% left · 12h 15m`. The primary quota window is shown; zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window's reset countdown (falling back to the retry deadline). Other authentication or availability errors replace stale usage details. Tooltips explicitly label reset countdowns.
+Each account occupies one line with its usage and reset countdown, including connected `app` accounts: `app · 17% left · 12h 15m`. Codex accounts show their primary quota window. Claude accounts show the limit chosen under **Claude Usage**: **5-Hour Limit** (the default) or **Weekly Limit**. The choice persists, applies to the desktop widget too, and does not affect routing. The menu offers it only when a Claude account is configured. Zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window's reset countdown (falling back to the retry deadline). Other authentication or availability errors replace stale usage details. Tooltips explicitly label reset countdowns.
 
 Top-level account rows have no checkmarks or routing labels. The tooltip identifies the account most recently used for an upstream request (`wired`). A single pool has no section header. Multiple pools get section headers named for their provider, Codex before Claude; when a provider has more than one pool, the header adds the pool name, such as `Codex · work`.
 
@@ -20,6 +20,21 @@ The app talks directly to the daemon's newline-delimited JSON protocol at `~/.co
 
 Status refreshes automatically every five seconds and when the menu opens. Only one status request runs at a time. While the menu is open, structural updates wait until it closes to avoid moving actions under the pointer. Failed reads preserve the last snapshot and show “Reconnecting”; the header tooltip includes the last successful refresh time and failure detail. Recovery clears the connection warning automatically. Account-change errors remain separate and clear on the next successful account change. Connection failures and recovery are recorded in macOS unified logging, with error details private.
 
+## Desktop widget
+
+The app embeds a WidgetKit extension, **Account Usage**, for the desktop and Notification Center. Add it from the widget gallery (right-click the desktop and choose **Edit Widgets…**). Each ring shows the remaining quota of the same window as the account's menu row, colored green, then orange below 25%, and red below 10% or while the account is rate-limited:
+
+- **Small** shows up to four rings; a single account gets one large ring with its next reset.
+- **Medium** shows up to four rings with names and reset countdowns.
+- **Large** lists accounts under Codex and Claude headings with a meter, remaining percentage, and countdown for every quota window.
+- **Extra large** combines a ring overview of up to eight accounts with two columns of window details.
+
+Inbound accounts are omitted because Comradex has no usage for them. Accounts that need sign-in or are unavailable show their state instead of usage. Clicking the widget opens the status menu.
+
+The widget is sandboxed and cannot reach the daemon's control socket. After each status poll, the menu app writes a compact usage snapshot to the shared app group container `<team-id>.com.nicosuave.comradex`, then asks WidgetKit to reload. State changes reload within 30 seconds; percentage changes reload at most every five minutes to stay within WidgetKit's reload budget. Reset countdowns advance every minute between reloads. Unchanged usage is rewritten every five minutes, so if the menu app stops running, the widget labels data older than 30 minutes with its age.
+
+App groups require the signing team, so the packaging script derives the team ID from the signing certificate (override with `TEAM_ID`). Ad-hoc builds still embed the widget, but without a shared container it shows its empty state.
+
 ## Build and test
 
 ```sh
@@ -36,7 +51,14 @@ Scripts/package_app.sh
 Scripts/compile_and_run.sh
 ```
 
-The package script always emits an `LSUIElement` menu-bar app (`MENU_BAR_APP=1`) and uses ad-hoc signing unless `APP_IDENTITY` is set. Set `ARCHES="arm64 x86_64"` for a universal build.
+The package script always emits an `LSUIElement` menu-bar app (`MENU_BAR_APP=1`) with the widget extension at `Contents/PlugIns/ComradexWidgets.appex`, and uses ad-hoc signing unless `APP_IDENTITY` is set. Set `ARCHES="arm64 x86_64"` for a universal build. To try the widget locally, sign with a team identity and use a separate bundle ID so the development build does not replace the installed app's widget:
+
+```sh
+BUNDLE_ID=com.nicosuave.comradex.menu.dev URL_SCHEME=comradex-menu-dev \
+  APP_IDENTITY="Developer ID Application: <name> (<team-id>)" Scripts/compile_and_run.sh
+```
+
+macOS caches widget descriptions per bundle version and keeps widget processes running, so `compile_and_run.sh` stamps each build with a new build number and stops this checkout's old widget process. Remove and re-add a placed widget if its kind changed.
 
 The running daemon must implement `ui_status`, `ui_refresh_usage`, `ui_use_reset_credit`, `ui_set_account_role`, `ui_start_login`, and `ui_login_status` on its existing user-only control socket.
 

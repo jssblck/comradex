@@ -1,4 +1,5 @@
 import AppKit
+import ComradexWidgetCore
 
 enum StatusIcon {
     static let image: NSImage = {
@@ -35,5 +36,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = MenuBarController(store: store)
         menuController = controller
         controller.start()
+    }
+
+    // Clicking the desktop widget opens its URL, which shows the status menu.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let expected = usageMenuURL(), urls.contains(expected) else { return }
+        // Let the open-URL event finish before the menu starts tracking.
+        DispatchQueue.main.async { [weak self] in self?.menuController?.showMenu() }
     }
 }

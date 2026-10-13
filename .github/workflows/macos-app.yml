@@ -34,6 +34,11 @@ jobs:
           test "$(lipo -archs ComradexMenu.app/Contents/MacOS/ComradexMenu)" = "x86_64 arm64" \
             || test "$(lipo -archs ComradexMenu.app/Contents/MacOS/ComradexMenu)" = "arm64 x86_64"
           plutil -lint ComradexMenu.app/Contents/Info.plist
+          widget=ComradexMenu.app/Contents/PlugIns/ComradexWidgets.appex
+          test "$(lipo -archs "$widget/Contents/MacOS/ComradexWidgets")" = "x86_64 arm64" \
+            || test "$(lipo -archs "$widget/Contents/MacOS/ComradexWidgets")" = "arm64 x86_64"
+          plutil -lint "$widget/Contents/Info.plist"
+          codesign -d --entitlements - --xml "$widget" | grep -q com.apple.security.app-sandbox
           codesign --verify --deep --strict --verbose=2 ComradexMenu.app
           ditto --norsrc -c -k --keepParent ComradexMenu.app ComradexMenu-macos-universal.zip
       - name: Upload menu app
